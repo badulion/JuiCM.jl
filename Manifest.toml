@@ -2,7 +2,7 @@
 
 julia_version = "1.13.1"
 manifest_format = "2.1"
-project_hash = "ee9223ac885acb0d13110ffb22655b9393825ace"
+project_hash = "2ca4bdcbe36572cf3918ca3b72c0d356a69b9233"
 
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
@@ -14,7 +14,7 @@ uuid = "e66e0078-7015-5450-92f7-15fbd957f2ae"
 version = "1.5.5+2"
 
 [[deps.JuiCM]]
-deps = ["LinearAlgebra", "OffsetArrays"]
+deps = ["LinearAlgebra", "OffsetArrays", "Random"]
 path = "."
 uuid = "4c0977cd-efcf-40c8-977d-f3f28b7f1c48"
 version = "0.1.0"
@@ -44,6 +44,15 @@ version = "1.17.0"
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
 uuid = "4536629a-c528-5b80-bd46-f80d51c5b363"
 version = "0.3.30+0"
+
+[[deps.Random]]
+deps = ["SHA"]
+uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+version = "1.11.0"
+
+[[deps.SHA]]
+uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+version = "1.0.0"
 
 [[deps.libblastrampoline_jll]]
 deps = ["Artifacts", "Libdl"]
