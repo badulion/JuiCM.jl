@@ -333,4 +333,8 @@ using Random
         fill!(f2, 2.5)
         @test all(==(2.5), f2.data)
     end
+
+    include("error_norms_test.jl")
+    include("williamson_ics_test.jl")
+    include("time_stepping_test.jl")
 end
