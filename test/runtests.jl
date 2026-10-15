@@ -333,4 +333,6 @@ using Random
         fill!(f2, 2.5)
         @test all(==(2.5), f2.data)
     end
+
+    include("error_norms_test.jl")
 end
