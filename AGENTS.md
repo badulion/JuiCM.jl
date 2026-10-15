@@ -11,11 +11,13 @@ if a task requires deviating from `DESIGN.md`, stop and open an issue instead.
 ## Project context
 
 - **What this is:** a from-scratch, fully-coupled ocean-atmosphere GCM in
-  pure Julia (cubed-sphere horizontal, z-star ocean vertical, single-node first).
+  pure Julia (icosahedral Voronoi horizontal with TRiSK operators, z-star ocean
+  vertical, single-node first). Grid family decided in DESIGN.md D9.
 - **The architecture is the research contribution.** Do not pull in GCM code
-  from other packages (no ClimaCore, no Oceananigans, no SpeedyWeather).
-  Infrastructure deps (NCDatasets, OffsetArrays, SeawaterPolynomials,
-  KernelAbstractions) are allowed; dycores, coupler, and physics are ours.
+  from other packages (no ClimaCore, no Oceananigans, no SpeedyWeather, no
+  MPAS-derived meshes). Infrastructure deps (NCDatasets, OffsetArrays,
+  SeawaterPolynomials, KernelAbstractions, Makie) are allowed; dycores, coupler,
+  physics, and the mesh generator are ours.
 - **Numerical bugs look like physics.** Green tests prove code runs, not that
   the physics is right. This is why the workflow below is strict.
 

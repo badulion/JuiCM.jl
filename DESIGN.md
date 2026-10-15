@@ -2,7 +2,7 @@
 
 A modular, fully-coupled General Circulation Model written from scratch in Julia.
 
-**Status:** Planning (v0.0) — no code exists yet.
+**Status:** Planning (v0.1) — no code exists yet.
 **Date:** 2026-10-15
 
 ---
@@ -28,11 +28,30 @@ system.**
 | D1 | Project goal | Research / open source | Validation, docs, and extensibility are first-class requirements |
 | D2 | Domain | Ocean / coupled | Coupled ocean-atmosphere system |
 | D3 | Coupling strategy | Fully coupled from day one | Coupler interfaces designed against real coupled physics, not retrofitted |
-| D4 | Horizontal grid | Unstructured (cubed-sphere) | No pole singularity; scales to eddying resolution; matches MPAS/ICON direction |
+| D4 | Horizontal grid | Icosahedral Voronoi (TRiSK) | See D9 below |
 | D5 | Build vs reuse | From scratch | The architecture *is* the research contribution |
 | D6 | Parallel target | Single node first | Fast debugging loop; field layout designed so MPI can slot in later |
 | D7 | Vertical coordinate | z-star (rescaled depth) | Realistic bathymetry, free-surface motion, MOM6/MPAS-compatible validation |
 | D8 | v0.1 milestone | Validated dycore benchmark | External ground truth is the only unambiguous bug detector |
+| D9 | Grid family (resolves #1) | Icosahedral TRiSK over cubed-sphere FV | Owner decision. TRiSK's mass/energy/potential-enstrophy conservation and the MPAS-O/ICON-O lineage outweigh cubed-sphere's faster time-to-first-result. Accepted costs: mesh generation is its own sub-project, every cell uses general unstructured machinery, debugging requires mesh visualization. Validation anchor is published benchmarks only (D9b), so no external-model grid-matching constraint applies |
+
+### Resolved sub-decision: grid family (D9, was §8.1)
+
+**Chosen: icosahedral C-grid (Voronoi) with TRiSK operators** — the MPAS-Ocean /
+ICON-O / DYNAMICO lineage.
+
+| | Icosahedral TRiSK (chosen) | Cubed-sphere FV (rejected) |
+|--|----------------------------|----------------------------|
+| Mesh generation | Icosahedron subdivision + Voronoi dual + Lloyd relaxation — a real sub-project | ~100 lines, gnomonic projection |
+| Operators | TRiSK set (Ringler et al. 2010), uniform complexity everywhere | Structured stencils inside faces, seams special |
+| Seams | None; 12 pentagon cells (dual of icosahedron vertices) are the only special cells | 12 edge pairs + 8 three-face corners |
+| Conservation | Mass, energy, AND potential enstrophy by construction | Mass exact; enstrophy not natural |
+| Precedent | MPAS-O, ICON-O, DYNAMICO | FV3, Oceananigans cubed sphere |
+
+The rejected alternative remains a permitted future second dycore: the
+`AbstractGrid`/`AbstractComponent` architecture allows a cubed-sphere component
+as a sibling without touching the coupler. Revisit only if TRiSK mesh
+generation proves fatal in Phase 0–1.
 
 ### Resolved tension: D3 vs D8
 
@@ -45,27 +64,6 @@ component-first.**
   before its output is trusted in a coupled run.
 - The coupled system's first spin-up uses only components that have individually
   passed their benchmarks.
-
-### Open sub-decision: cubed-sphere vs icosahedral (from D4)
-
-These are different machines, not variants of one choice:
-
-| | Cubed-sphere (finite-volume) | Icosahedral (Voronoi/Delaunay) |
-|--|------------------------------|-------------------------------|
-| Precedent | Oceananigans cubed sphere, GEOS, MITgim | MPAS-Ocean, ICON-O, DYNAMICO |
-| Mesh generation | 6 structured faces, moderate | Fibonacci/recursive subdivision, then Voronoi dual — heavy |
-| Operators | Structured stencils *within* faces + halo exchange at 8 face edges | TRiSK operator set on unstructured primal/dual meshes |
-| Julia difficulty | Moderate — faces are ordinary arrays with periodic-style edge exchange | High — you own mesh generation, dual meshes, and flux reconstruction |
-
-**Recommendation: cubed-sphere finite-volume.** Within each of the 6 faces the
-grid is structured, so Julia arrays and stencil loops work directly; only the 8
-face-edge boundaries need interpolation logic. This is the fastest path from
-scratch to a validated 3D dycore, and Oceananigans.jl's cubed-sphere work
-provides a published precedent for the face-edge exchange scheme. The TRiSK
-icosahedral path is a research project in computational geometry before it is a
-GCM.
-
-This needs explicit sign-off before Phase 1 begins.
 
 ---
 
@@ -86,7 +84,7 @@ This needs explicit sign-off before Phase 1 begins.
 │  │ modules │ │  │   grid interpolation)│  │ │  modules  │ │
 │  └─────────┘ │  └────────────────────┘  │ └───────────┘ │
 ├──────────────┴──────────────────────────┴───────────────┤
-│         Shared infrastructure (grids, fields, I/O)       │
+│         Shared infrastructure (mesh, fields, I/O)        │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -101,14 +99,17 @@ JuiCM.jl/
 ├── Project.toml
 ├── src/
 │   ├── JuiCM.jl              # top module: using ./re-exports
-│   ├── Grids/
-│   │   ├── CubedSphere.jl    # face generation, coordinates, metric terms
-│   │   ├── Connectivity.jl    # face-edge exchange tables, halos
-│   │   └── VertGrids.jl      # z-star stretched vertical levels
+│   ├── Mesh/
+│   │   ├── Icosahedron.jl    # icosahedron construction, recursive subdivision
+│   │   ├── Voronoi.jl        # spherical Voronoi dual (C-grid), adjacency tables
+│   │   ├── SCVT.jl           # Lloyd relaxation → smoothed centroidal Voronoi tessellation
+│   │   └── MeshQuality.jl    # cell quality metrics, imprinting diagnostics
 │   ├── Fields/
-│   │   ├── Field.jl         # Field{G, T, N}: data + grid + location
-│   │   ├── Operators.jl      # grad, div, curl, interpolation (stencils)
-│   │   └── Exchange.jl       # halo update across face edges
+│   │   ├── Field.jl         # Field{G, T, N}: data + mesh + location
+│   │   ├── TRiSK.jl          # TRiSK operators (Ringler et al. 2010):
+│   │   │                     #   gradient, divergence, vorticity, curl,
+│   │   │                     #   normal/tangential reconstruction, flux terms
+│   │   └── Halo.jl           # halo update machinery (MPI-ready; local single-node first)
 │   ├── Dycore/
 │   │   ├── Atmos/
 │   │   │   ├── Prognostics.jl    # state containers
@@ -127,7 +128,7 @@ JuiCM.jl/
 │   ├── Coupler/
 │   │   ├── Interface.jl
 │   │   ├── Fluxes.jl          # bulk formulas → momentum, heat, freshwater
-│   │   └── Remapping.jl      # atmos ↔ ocean grid interpolation
+│   │   └── Remapping.jl      # atmos ↔ ocean mesh interpolation (conservative)
 │   ├── Diagnostics/
 │   │   ├── Budgets.jl        # mass/energy/tracer conservation monitors
 │   │   └── Output.jl         # NetCDF writer
@@ -148,25 +149,27 @@ JuiCM.jl/
 These five types are the architecture. Everything else is implementations of them.
 
 ```julia
-# 1. Grid — immutable geometry + connectivity
-abstract type AbstractGrid{FT} end
-struct CubedSphereGrid{FT} <: AbstractGrid{FT}
-    # 6 faces × Ni × Nj × Nk, coordinates, metric terms, edge tables
+# 1. Mesh — immutable geometry + connectivity
+abstract type AbstractMesh{FT} end
+struct VoronoiSphereMesh{FT} <: AbstractMesh{FT}
+    # primal (Voronoi cell) and dual (triangle) meshes:
+    # xyz coordinates, cell/edge/vertex adjacency tables,
+    # edge normal/tangential vectors, cell areas, edge lengths, weights
 end
 
-# 2. Field — data at a grid location. Parametric for future MPI/GPU.
-struct Field{G<:AbstractGrid, T, N, AX}
-    data::OffsetArray{T, N, AX}   # AX is abstract → Array today, MPIArray later
-    grid::G
-    location::FieldLocation        # Center / Face1 / Face2 / Face3 (C-grid staggering)
+# 2. Field — data at a mesh location. Parametric for future MPI/GPU.
+struct Field{M<:AbstractMesh, T, N, AX}
+    data::AX                      # AX is abstract → Array today, MPIArray later
+    mesh::M
+    location::FieldLocation        # Cell / Edge / Vertex (C-grid staggering)
 end
 
 # 3. Prognostic state — what time integration advances
 struct PrognosticState{FT}
-    u::Field   # staggered velocities
-    η::Field   # free surface (ocean) / surface pressure (atmos)
-    θ::Field   # potential temperature
-    S::Field   # salinity (ocean), tracers generally
+    uₙ::Field   # normal velocities on edges (TRiSK prognostic)
+    η::Field    # free surface (ocean) / surface pressure (atmos)
+    θ::Field    # potential temperature
+    S::Field    # salinity (ocean), tracers generally
 end
 
 # 4. Physics module — everything implements this
@@ -187,14 +190,18 @@ function surface_fluxes(comp::AbstractComponent) ... end
 (`compute_tendency!`) dispatched on module type, so physics modules are pure
 data + one function. Adding a parameterization = defining one struct + one
 method. Swapping the ocean dycore = new `AbstractComponent` subtype; the
-coupler never sees the difference. Function barriers (`step!`, the stencil
-kernels inside `Operators.jl`) keep type-stability once grids and fields are
-concrete.
+coupler never sees the difference. Function barriers (`step!`, the TRiSK
+operator kernels) keep type-stability once mesh and fields are concrete.
 
-**MPI escape hatch (D6):** `Field.data` is typed by an abstract array parameter.
-Day one it's `Array`. Later, `MPIMultiArray`-style types can replace it without
-touching physics code — provided physics code never indexes `data` directly,
-only through operators. Enforce this in review and lint.
+**TRiSK data layout note:** velocities live on edges, vorticity on vertices,
+mass/tracers on cells. The adjacency tables in the mesh make every operator a
+gather over precomputed neighbor lists — flat arrays, no indirect
+decomposition needed for single-node runs.
+
+**MPI escape hatch (D6):** `Field.data` is typed by an abstract array
+parameter. Day one it's `Array`. Later, partitioned array types can replace it
+without touching physics code — provided physics code never indexes `data`
+directly, only through operators. Enforce this in review and lint.
 
 ### 3.4 Coupler design
 
@@ -203,7 +210,7 @@ The coupler is a module, not a god-object:
 1. **Pull** surface fluxes from each component (`surface_fluxes`).
 2. Compute coupled fluxes from bulk formulas (momentum stress, latent +
    sensible heat, evaporation - precipitation).
-3. **Remap** fluxes between the atmospheric and ocean grids (both cubed-sphere
+3. **Remap** fluxes between the atmospheric and ocean meshes (both icosahedral
    but potentially different resolutions — conservative remapping via
    overlap areas).
 4. **Push** fluxes into each component's next tendency evaluation.
@@ -222,8 +229,9 @@ suite for every future change.
 
 | Rung | Test | Pass criterion | Component |
 |------|------|----------------|-----------|
-| V0 | 2D advection on cubed-sphere faces | convergence order ≥ 1.5 on smooth field | Operators.jl |
-| V1 | Shallow-water Williamson cases 2, 5, 6 | Williamson error norms within published ranges | Grids + Exchange +Operators |
+| V0 | 2D advection on the icosahedral mesh | convergence order ≥ 1.5 on smooth field | Mesh + TRiSK operators |
+| V0.5 | Mesh quality suite | 12 pentagons; total area 4πR²; cell quality metrics in bounds; imprinting below tolerance in SW tests | Mesh |
+| V1 | Shallow-water Williamson cases 2, 5, 6 | Williamson error norms within published ranges | Mesh + TRiSK |
 | V2 | 3D Held-Suarez (atmos) | zonal-mean T, u vs. published Held & Suarez 1994 figures | Atmos dycore |
 | V3 | Gravity current / lock exchange (ocean) | front position vs. published laboratory data | Ocean dycore |
 | V4 | Overflow / dense current on slope (ocean) | interface spreading rates vs. published results | Ocean dycore + z-star |
@@ -234,6 +242,11 @@ Reference data: digitized from publications where necessary, stored in
 `test/reference_data/` with provenance documented. Every reference dataset gets
 a `README` stating source, digitization method, and expected tolerance.
 
+**Benchmark-only validation anchor (D9b):** pass criteria are published values
+from the benchmark literature, not intermodel comparisons. Cross-model
+comparison (e.g. against MPAS-O test-case output) is permitted as extra
+evidence but never a merge gate.
+
 ---
 
 ## 5. Phased roadmap
@@ -242,31 +255,34 @@ Effort estimates assume one researcher working evenings + weekends with AI
 pair-programming. Estimates are for working code; validation chasing bugs is
 the variable.
 
-### Phase 0 — Scaffolding (1 week)
+### Phase 0 — Scaffolding + mesh generation (2–4 weeks)
 - Package skeleton, CI (Julia 1.10+, `Pkg.test`, formatter, Aqua.jl)
-- `Grids`: cubed-sphere face generation with metric terms
-- `test`: face geometry invariants (areas sum to 4πr², coordinate round-trips)
-- **Exit:** `] test` green, grid visualizations committed
+- `Mesh`: icosahedron → subdivision → spherical Voronoi dual → SCVT (Lloyd)
+- `test`: mesh invariants (12 pentagons, areas sum to 4πr², adjacency
+  consistency, quality metrics) → rung V0.5
+- **Exit:** `] test` green, mesh quality report + visualization committed
+- **Note:** for TRiSK the mesh generator is itself a deliverable. This is the
+  largest single chunk of the project and where the D9 risk lands.
 
 ### Phase 1 — Shallow water on the sphere (3–6 weeks)
-- `Fields`, `Operators`, `Exchange` (face-edge halo interpolation)
-- Shallow-water equations on the cubed-sphere
+- `Fields` (cell/edge/vertex staggering), `TRiSK` operator set
+- Shallow-water equations on the icosahedral C-grid, explicit SSPRK stepping
 - Williamson test suite 2/5/6 → rungs V0, V1
 - **Exit:** Williamson 5 (zonal flow over a mountain) within published error norms
-- **This is the riskiest phase** — face-edge exchange correctness is where
-  from-scratch cubed-sphere projects live or die. Budget extra time here.
+- Grid imprinting and computational-mode checks are part of this phase's suite
+  (icosahedral-specific failure modes; see §7).
 
 ### Phase 2 — 3D ocean dycore (6–10 weeks)
-- Extend grid to 3D with z-star vertical
+- Extend mesh to 3D with z-star vertical
 - Primitive equations: pressure gradient, continuity, vertical velocity
-- Advection schemes (upwind → higher-order)
+- Advection schemes (upwind → higher-order, positive-definite on unstructured)
 - Gravity current + overflow benchmarks → rungs V3, V4
 - **Exit:** overflow benchmark matches published interface positions
 
 ### Phase 3 — 3D atmos dycore in parallel (4–8 weeks, overlaps Phase 2)
-- Hydrostatic/anelastic atmosphere on the same grid machinery
+- Hydrostatic/anelastic atmosphere on the same mesh machinery
 - Held-Suarez → rung V2
-- Shares Operators/Exchange entirely — this phase is mostly ocean-vs-atmos
+- Shares Mesh/TRiSK entirely — this phase is mostly ocean-vs-atmos
   equation differences
 - **Exit:** Held-Suarez zonal means match published figures
 
@@ -290,17 +306,19 @@ the variable.
 | Choice | Decision | Why |
 |--------|----------|-----|
 | Julia version | ≥ 1.10 | stable performance features |
-| Array types | `OffsetArray` for stencil halos | index-space locality at faces |
+| Array types | flat arrays + precomputed adjacency tables | TRiSK gathers are neighbor-list loops; SIMD-friendly |
+| Mesh generation | native Julia (Icosahedron → Voronoi → SCVT) | from-scratch rule (D5); JIGSAW/Gmsh forbidden as mesh code — the mesh is ours |
 | Output | NetCDF via NCDatasets.jl | community-standard, cf-conventions |
 | Equation of state | SeawaterPolynomials.jl | the one wheel not worth reinventing (a pure-Julia, citation-backed library — using it is reuse of *physics*, not architecture) |
 | AD | Enzyme.jl later (parameter calibration) | defer; not needed for v0.x |
 | GPU | KernelAbstractions.jl-compatible kernels from Phase 1 | kernel style costs little now, unlocks GPU later |
-| Docs | Documenter.jl from day one | open-source requirement (D1) |
+| Mesh visualization | Makie.jl (dev-time only dep) | debugging an unstructured mesh requires plotting it |
 
 **The one dependency rule:** infrastructure dependencies (NCDatasets,
-SeawaterPolynomials, OffsetArrays, KernelAbstractions) are fine — they're
-tools. **No GCM code:** no ClimaCore, no Oceananigans, no SpeedyWeather. The
-dycores, coupler, and physics are ours, from scratch (D5).
+SeawaterPolynomials, KernelAbstractions, Makie) are fine — they're tools.
+**No GCM code:** no ClimaCore, no Oceananigans, no SpeedyWeather, no
+MPAS-derived meshes. The dycores, coupler, physics, and mesh generator are
+ours, from scratch (D5).
 
 ---
 
@@ -308,9 +326,11 @@ dycores, coupler, and physics are ours, from scratch (D5).
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| Cubed-sphere edge exchange bugs corrupt everything downstream | Critical | Phase 1 Williamson suite is dedicated to exactly this; do not skip |
+| Mesh generation (Voronoi dual + SCVT convergence) stalls Phase 0 | Critical | Largest single estimate in the plan; icosahedral geodesic libraries' algorithms are published; subdivision-only (non-SCVT) mesh is an acceptable Phase 0 fallback with quality metrics recorded |
+| Grid imprinting on icosahedron symmetry lines contaminates results | High | V0.5 imprinting suite + Williamson cases are designed to expose exactly this; document pentagon-cell error contribution |
+| TRiSK computational modes / Hollingsworth-type instability | High | Follow Ringler et al. 2010 flux formulations exactly; Smagorinsky + instability checks in Phase 1 suite |
 | Project stalls in infrastructure before science (classic from-scratch death) | High | Validation ladder gives a shippable result at every rung; each rung is a demo |
-| Single person can't sustain phases 2–4 | High | Phases 2 and 3 share all grid machinery; design doc is the recruiting doc |
+| Single person can't sustain phases 2–4 | High | Phases 2 and 3 share all mesh machinery; design doc is the recruiting doc |
 | z-star pressure-gradient errors produce spurious flows | Medium | Known bug class — compare z-star runs against flat-bottom (simple-z) runs as debugging reference |
 | Conservation leaks in the coupler | Medium | Budget monitors at runtime, fail-CI on any leak |
 | Julia compile latency hurting iteration | Low | Precompile workloads; Revise.jl for dev loop |
@@ -319,17 +339,18 @@ dycores, coupler, and physics are ours, from scratch (D5).
 
 ## 8. Open questions
 
-1. **Cubed-sphere vs icosahedral** (§2.1) — recommendation is cubed-sphere
-   FV; needs sign-off.
-2. **Atmosphere vertical coordinate** — this doc fixed the ocean's (z-star);
-   the atmosphere needs its own decision (σ vs hybrid σ-p) by Phase 3.
-3. **Time stepping** — start with explicit (RK4/SSPRK) for validation, implicit
+1. **Atmosphere vertical coordinate** — the atmosphere needs its own decision
+   (σ vs hybrid σ-p) by Phase 3.
+2. **Time stepping** — start with explicit (RK4/SSPRK) for validation, implicit
    vertical later. Which implicit solver (native vs Krylov, matrix-free?) is a
    Phase 4 decision.
-4. **Grid resolution strategy for coupled runs** — atmos typically runs 2–4×
+3. **Mesh resolution strategy for coupled runs** — atmos typically runs 2–4×
    coarser than ocean; conservative remapping must handle this from V6 on.
+4. **SCVT stopping criterion** — Lloyd relaxation convergence tolerance and
+   iteration cap for Phase 0; acceptance thresholds in V0.5.
+5. **Mesh persistence format** — regenerate per run vs cached JLD2/NetCDF
+   mesh files (regeneration cost vs reproducibility tradeoff).
 
 ---
 
-*Generated from the office-hours planning session. Phase 0 cannot start until
-§8.1 (grid family) is decided.*
+*Grid family decided (D9, closes #1): icosahedral TRiSK. Phase 0 may start.*
