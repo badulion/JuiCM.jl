@@ -215,4 +215,6 @@ using Random
         m1 = generate_icosahedral_mesh(n_subdivisions=2, lloyd_iterations=3)
         @test minimum(m1.cell_quality) ≥ minimum(m0.cell_quality) - 1e-9
     end
+
+    include("error_norms_test.jl")
 end
