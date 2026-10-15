@@ -263,4 +263,74 @@ using Random
               sum(m0.cell_quality) / m0.n_cells
         @test minimum(m3.cell_quality) > minimum(m0.cell_quality)
     end
+
+    @testset "fields: type-stable staggering API (#8)" begin
+        using JuiCM.Fields: FieldLocation, CellLoc, EdgeLoc, VertexLoc,
+                            location, mesh_of, similar_field, length_of
+
+        m = generate_icosahedral_mesh(n_subdivisions=1)
+
+        # construction: correct counts, element types, locations
+        h = CellField(m)
+        u = EdgeField(m)
+        η = VertexField(m)
+        @test length(h) == m.n_cells
+        @test length(u) == m.n_edges
+        @test length(η) == m.n_vertices
+        @test eltype(h) == Float64
+        @test location(h) == CellLoc()
+        @test location(u) == EdgeLoc()
+        @test location(η) == VertexLoc()
+        @test location(h) isa FieldLocation
+        @test mesh_of(h) === m
+
+        # float type selection + callable initialization
+        h32 = CellField(m, Float32)
+        @test eltype(h32) == Float32
+        hc = CellField(i -> sin(1.0), m)
+        @test hc[1] == sin(1.0)
+        uc = EdgeField(e -> Float64(e) / 10, m)
+        @test uc[10] == 1.0
+
+        # indexing reads/writes at the right location
+        h[1] = 3.5
+        @test h[1] == 3.5
+        u[m.n_edges] = -1.25
+        @test u[m.n_edges] == -1.25
+
+        # type-stable construction and arithmetic
+        @inferred CellField(m)
+        @inferred EdgeField(m)
+        @inferred VertexField(m)
+        @inferred CellField(i -> 1.0, m)
+        @inferred similar_field(h)
+        @inferred similar_field(h, Float32)
+        @inferred h + h
+        @inferred h - h
+        @inferred 2.0 * h
+        @inferred h / 2
+        @inferred -h
+
+        # similar-type arithmetic preserves type and mesh
+        s = h + h
+        @test s isa Field && location(s) == CellLoc()
+        @test mesh_of(s) === m
+        @test s.data == 2 .* h.data
+
+        # mixing staggers is a type error (TRiSK staggering is not mixable)
+        @test_throws MethodError h + u
+        @test_throws MethodError h + η
+        @test_throws MethodError u + η
+
+        # similar_field: same type & mesh, fresh storage
+        f2 = similar_field(h)
+        @test location(f2) == CellLoc() && mesh_of(f2) === m
+        @test f2.data !== h.data
+        f32 = similar_field(h, Float32)
+        @test eltype(f32) == Float32
+
+        # fill!
+        fill!(f2, 2.5)
+        @test all(==(2.5), f2.data)
+    end
 end
