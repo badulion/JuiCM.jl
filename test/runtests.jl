@@ -335,4 +335,5 @@ using Random
     end
 
     include("error_norms_test.jl")
+    include("williamson_ics_test.jl")
 end
