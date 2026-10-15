@@ -32,7 +32,8 @@ Sign conventions (T09 Eq 9, Ringler Eq 21–23):
 """
 module Voronoi
 
-export VoronoiSphereMesh, generate_icosahedral_mesh
+export VoronoiSphereMesh, generate_icosahedral_mesh,
+       mesh_summary, adjacency_consistent, kite_uniformity
 
 using LinearAlgebra: norm, normalize, cross, dot
 using ..Icosahedron: icosahedron, subdivide
@@ -90,6 +91,8 @@ struct VoronoiSphereMesh{FT}
     pentagon_cells::Vector{Int}
     cell_quality::Vector{FT}
 end
+
+include("Quality.jl")
 
 # ---------------------------------------------------------------- geometry
 
