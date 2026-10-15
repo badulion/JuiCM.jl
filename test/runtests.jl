@@ -215,4 +215,52 @@ using Random
         m1 = generate_icosahedral_mesh(n_subdivisions=2, lloyd_iterations=3)
         @test minimum(m1.cell_quality) ≥ minimum(m0.cell_quality) - 1e-9
     end
+
+    @testset "mesh quality suite (#4, rung V0.5)" begin
+        using JuiCM: mesh_summary, adjacency_consistent, kite_uniformity
+
+        for (lev, lloyd) in ((0, 0), (1, 0), (2, 2))
+            m = generate_icosahedral_mesh(n_subdivisions=lev,
+                                          lloyd_iterations=lloyd)
+
+            # summary aggregates are consistent with the mesh
+            s = mesh_summary(m)
+            @test s.n_cells == m.n_cells
+            @test s.total_area ≈ 4π rtol = 1e-12
+            @test s.n_pentagons == 12
+            @test 0 < s.min_quality ≤ 1
+            @test s.min_quality ≤ s.mean_quality
+
+            # full adjacency consistency (V0.5: every edge 2 cells, dual
+            # graph consistent, polygons close)
+            @test adjacency_consistent(m)
+
+            # kite uniformity in bounds; icosahedral family ≥ 0.8 for
+            # these levels (0.85 at level 0, improving under Lloyd)
+            @test kite_uniformity(m) > 0.8
+        end
+
+        # SCVT convergence reproducibility: mesh generation is deterministic
+        # (no RNG), so two identical calls give identical meshes.
+        a = generate_icosahedral_mesh(n_subdivisions=1, lloyd_iterations=2)
+        b = generate_icosahedral_mesh(n_subdivisions=1, lloyd_iterations=2)
+        @test a.cell_xyz == b.cell_xyz
+        @test a.cell_area == b.cell_area
+        @test a.cell_quality == b.cell_quality
+
+        # level-1 icosphere is already an SCVT fixed point: Lloyd does not
+        # move any center (centers coincide with cell centroids by the
+        # subdivision symmetry)
+        m0 = generate_icosahedral_mesh(n_subdivisions=1, lloyd_iterations=0)
+        m3 = generate_icosahedral_mesh(n_subdivisions=1, lloyd_iterations=3)
+        @test m0.cell_xyz ≈ m3.cell_xyz atol = 1e-12
+
+        # level 2 is not at the fixed point; Lloyd strictly improves both
+        # the mean and the minimum cell quality (V0.5: SCVT convergence)
+        m0 = generate_icosahedral_mesh(n_subdivisions=2, lloyd_iterations=0)
+        m3 = generate_icosahedral_mesh(n_subdivisions=2, lloyd_iterations=3)
+        @test sum(m3.cell_quality) / m3.n_cells >
+              sum(m0.cell_quality) / m0.n_cells
+        @test minimum(m3.cell_quality) > minimum(m0.cell_quality)
+    end
 end
