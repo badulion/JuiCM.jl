@@ -447,6 +447,16 @@ function build_from_triangulation(tri)
                 end
                 v2 = cell_corners[c][p_e]
                 n_out = edge_cells[1, eprime] == c ? 1 : -1
+                # t̂_e points toward the `edge_vertex_pos` end of e (the
+                # convention verified against solid-body circulation in
+                # the curl/vorticity operator). The CCW walk around cell c
+                # arrives at the corner where e ENTERS the walk — but the
+                # walk starts at e' and moves CCW, so the arrival corner
+                # is the CCW-EXIT corner of e, which is the +t̂ end only
+                # when t̂ aligns with the CCW traversal of this cell.
+                # Rather than re-deriving per cell, evaluate both ends of
+                # e geometrically: t^e_{v2} = +1 iff v2 is the
+                # edge_vertex_pos end.
                 t_e_v2 = edge_vertex_pos[e] == v2 ? 1 : -1
                 acc[eprime] = get(acc, eprime, zero(FT)) +
                               n_out * t_e_v2 * (S - FT(1 / 2)) * l_e[eprime] / d_e[e]
