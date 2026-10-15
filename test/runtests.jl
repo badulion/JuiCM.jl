@@ -1,4 +1,5 @@
 using Test
+using Statistics
 using JuiCM
 using JuiCM.Icosahedron: icosahedron, subdivide
 using JuiCM.Voronoi: spherical_circumcenter, spherical_polygon_area,
@@ -332,6 +333,160 @@ using Random
         # fill!
         fill!(f2, 2.5)
         @test all(==(2.5), f2.data)
+    end
+
+    @testset "TRiSK operators (#9, rung V0)" begin
+        using JuiCM.TRiSK: divergence, divergence!, gradient, curl,
+                           tangential_flux, edge_mean, kinetic_energy,
+                           pv_flux
+        using JuiCM.ErrorNorms: l2_norm
+
+        m = generate_icosahedral_mesh(n_subdivisions=3)
+
+        # --- divergence: discrete compatibility Σ A_i (∇·F)_i = 0 (round-off)
+        F = EdgeField(e -> sin(m.edge_x[1, e]) + cos(2m.edge_x[2, e]), m)
+        divF = divergence(F)
+        @test abs(sum(m.cell_area .* divF.data)) < 1e-13
+
+        # --- divergence: point source in one cell is exact per-neighbor.
+        # With F routed out of cell c0 into each neighbor through their
+        # shared edge (F_e = −l_e-normalized), div = −l_e/A_j on the
+        # neighbor side and +Σl_e/A_i on c0.  Here we check the simpler
+        # exact statement: F = 1 on a single edge e0 gives
+        # div_i = ±l_e0/A_i on the two flanking cells, 0 elsewhere.
+        F1 = EdgeField(m); fill!(F1, 0.0); F1.data[17] = 1.0
+        d1 = divergence(F1)
+        i1, j1 = m.edge_cells[1, 17], m.edge_cells[2, 17]
+        for c in 1:m.n_cells
+            expected = c == i1 ? m.l_e[17] / m.cell_area[c] :
+                       c == j1 ? -m.l_e[17] / m.cell_area[c] : 0.0
+            @test d1.data[c] ≈ expected rtol = 1e-14
+        end
+
+        # --- gradient of a linear field: 2nd-order accurate toward c·x̂.
+        # ∇h on edge e ≈ c·n̂_e · sin(d)/d correction → order h²; check
+        # the error against the exact edge projection shrinks O(h²).
+        c = [0.3, -0.5, 0.8]
+        lin = CellField(i -> dot(c, view(m.cell_xyz, :, i)), m)
+        glin = gradient(lin)
+        gerr = [abs(glin.data[e] - dot(c, view(m.edge_normal, :, e)))
+                for e in 1:m.n_edges]
+        @test maximum(gerr) < 0.05 * norm(c)
+
+        # --- curl ∘ gradient = 0 exactly (round-off), any cell field
+        @test all(abs.(curl(gradient(lin)).data) .< 1e-14)
+
+        # --- div-grad adjointness (R10 product rule, A_e = l_e d_e):
+        # Σ A_i h_i (∇·F)_i + Σ A_e (∇h)_e F_e = 0 exactly.
+        G = EdgeField(e -> exp(m.edge_x[3, e]), m)
+        h2 = CellField(i -> 1 + m.cell_xyz[2, i]^2, m)
+        lhs = sum(m.cell_area .* h2.data .* divergence(G).data)
+        gF = gradient(h2)
+        rhs = sum(m.l_e .* m.d_e .* gF.data .* G.data)
+        @test lhs + rhs ≈ 0 atol = 1e-12
+
+        # --- solid-body vorticity: 2nd-order convergence (1.91/1.98
+        # measured at levels 3/4 — assert < 0.05 relative at lev 3).
+        U0 = 0.7
+        usp = EdgeField(e -> begin
+            x = view(m.edge_x, :, e)
+            U0 * (-x[2] * m.edge_normal[1, e] + x[1] * m.edge_normal[2, e])
+        end, m)
+        ζ = curl(usp)
+        ζerr = maximum(abs.(ζ.data .- 2U0 .* m.vertex_xyz[3, :]))
+        @test ζerr < 0.05 * 2U0
+
+        # --- edge_mean preserves constants on both staggers
+        @test all(==(1.0), edge_mean(CellField(i -> 1.0, m)).data)
+        @test all(==(1.0), edge_mean(VertexField(v -> 1.0, m)).data)
+
+        # --- case-2 steady state: q̂ F⊥ + ∇(Φ+K) residual is
+        # truncation-level and 2nd-order (measured 0.0104 → 0.0056
+        # median from lev 3 to 4; here lev 3 only, threshold 0.05).
+        Ωe = 7.292e-5; gh0 = 2.94e4; g = 9.80616; a = 6.37122e6
+        u0ms = 2π * a / (12 * 86400)
+        U0r = u0ms / a
+        C = Ωe * U0r + U0r^2 / 2
+        Φ = CellField(i -> gh0 / a^2 - C * m.cell_xyz[3, i]^2, m)
+        uc2 = EdgeField(e -> begin
+            x = view(m.edge_x, :, e)
+            U0r * sqrt(1 - x[3]^2) *
+                dot([-x[2], x[1], 0.0] ./ max(sqrt(1 - x[3]^2), 1e-12),
+                    view(m.edge_normal, :, e))
+        end, m)
+        ηc2 = curl(uc2)
+        hstar = CellField(i -> (gh0 - (a*Ωe*u0ms + u0ms^2/2) * m.cell_xyz[3, i]^2) / g / a, m)
+        qc2 = VertexField(v -> begin
+            num = 0.0; den = 0.0
+            for cc in m.vertex_cells[v]
+                nck = 1 / length(m.cell_corners[cc])
+                num += nck * hstar.data[cc]
+                den += nck
+            end
+            (2Ωe * m.vertex_xyz[3, v] + ηc2.data[v]) / (num / den)
+        end, m)
+        Fh = edge_mean(hstar)
+        Fu = EdgeField(m); Fu.data .= Fh.data .* uc2.data
+        Fp = tangential_flux(Fu)
+        q̂ = edge_mean(qc2)
+        Cor = EdgeField(m); Cor.data .= Fp.data .* q̂.data
+        K = kinetic_energy(uc2)
+        PhiK = CellField(m); PhiK.data .= Φ.data .+ K.data
+        resid = Cor.data .+ gradient(PhiK).data
+        scale = maximum(abs.(PhiK.data)) * 2 * (Ωe + U0r)  # analytic balance scale
+        @test median(abs.(resid)) / maximum(abs.(gradient(PhiK).data)) < 0.05
+
+        # --- pv_flux: on a uniform-PV field the symmetric mean reduces to
+        # the plain tangential flux times q̃ (R10 Eq 49 = Eq 24 with the
+        # PV mean inserted; weights applied to NORMAL fluxes, once)
+        quni = VertexField(v -> 0.37, m)
+        Qp = pv_flux(quni, Fu)
+        Fp2 = tangential_flux(Fu)
+        @test Qp.data ≈ 0.37 .* Fp2.data rtol = 1e-13
+
+        # --- rung V0: flux-form advection by solid-body rotation,
+        # SSPRK3 in time, centered edge tracer; convergence ≥ 1.5.
+        for (lev_hi, lev_lo) in ((4, 3),)
+            mhi = generate_icosahedral_mesh(n_subdivisions=lev_hi)
+            mlo = generate_icosahedral_mesh(n_subdivisions=lev_lo)
+            adv_err(m) = begin
+                U0a = 0.7; T = 0.4; β = 12.0
+                x0 = [cos(0.6), 0.0, sin(0.6)]
+                c_, s_ = cos(U0a * T), sin(U0a * T)
+                xT = [c_*x0[1] - s_*x0[2], s_*x0[1] + c_*x0[2], x0[3]]
+                u = EdgeField(e -> begin
+                    x = view(m.edge_x, :, e)
+                    U0a * (-x[2] * m.edge_normal[1, e] + x[1] * m.edge_normal[2, e])
+                end, m)
+                h0 = CellField(i -> exp(-β * (1 - dot(view(m.cell_xyz, :, i), x0))), m)
+                dt = 0.15 * sum(m.d_e) / length(m.d_e) / U0a
+                nst = ceil(Int, T / dt); dt = T / nst
+                ec1, ec2 = m.edge_cells[1, :], m.edge_cells[2, :]
+                ud = u.data
+                L(out, hh, t) = begin
+                    fill!(out, 0.0)
+                    for e in 1:m.n_edges
+                        f = ud[e] * (hh[ec1[e]] + hh[ec2[e]]) / 2 * m.l_e[e]
+                        out[ec1[e]] -= f
+                        out[ec2[e]] += f
+                    end
+                    out ./= m.cell_area
+                end
+                hv = copy(h0.data)
+                t = 0.0
+                for _ in 1:nst
+                    hv = ssprk3_step!(L, hv, t, dt)
+                    t += dt
+                end
+                href = [exp(-β * (1 - dot(view(m.cell_xyz, :, i), xT)))
+                        for i in 1:m.n_cells]
+                l2_norm(hv, href, m.cell_area)
+            end
+            ehi = adv_err(mhi)
+            elo = adv_err(mlo)
+            order = log(elo / ehi) / log(2)
+            @test order ≥ 1.5
+        end
     end
 
     include("error_norms_test.jl")

@@ -270,18 +270,22 @@ with `q̃_e` the arithmetic mean of the vertex PV at the two ends of `e`
 energetically neutral in the discrete global sum (R10 Eqs 37–47).
 
 The stored `ecp_weights` already include the `l_{e'}/d_e` factors, so
-`Q⊥_e = Σ w_{e,e'} F_{e'} (q̃_e + q̃_{e'})/2`. `out` must not alias `F`
-or `scratch`; a fresh field is allocated for the intermediate F⊥ when
-`scratch` is not supplied.
+`Q⊥_e = Σ w_{e,e'} F_{e'} (q̃_e + q̃_{e'})/2` where `F` is the *normal*
+flux field — Eq 49 is Eq 24 (the flux mapping) with the symmetric PV
+mean inserted into the same sum, applied once. `out` may alias `F` only
+if `scratch` is provided.
 """
-function pv_flux!(out::EdgeField, F::EdgeField, q::VertexField,
+function pv_flux!(out::EdgeField, q::VertexField, F::EdgeField,
                   scratch::Union{Nothing, EdgeField} = nothing)
     mesh = F.mesh
     q̃ = edge_mean(q)                       # q at edge points (R10 Eq 50)
-    # F⊥ in its own storage (never in `out`: out receives the final result)
-    Fp = (scratch === nothing || scratch.data === out.data) ?
-         similar_field(F) : scratch
-    tangential_flux!(Fp, F)
+    src = F.data
+    if out.data === src
+        scratch === nothing &&
+            error("pv_flux!: out aliases F — pass a scratch EdgeField")
+        copyto!(scratch.data, F.data)
+        src = scratch.data
+    end
     for e in 1:mesh.n_edges
         acc = 0.0
         wts = mesh.ecp_weights[e]
@@ -289,7 +293,7 @@ function pv_flux!(out::EdgeField, F::EdgeField, q::VertexField,
         for k in eachindex(eds)
             ep = eds[k]
             # w includes l_{e'}/d_e; the (q̃_e+q̃_{e'})/2 symmetric mean:
-            acc += wts[k] * (q̃.data[e] + q̃.data[ep]) / 2 * Fp.data[ep]
+            acc += wts[k] * src[ep] * (q̃.data[e] + q̃.data[ep]) / 2
         end
         out.data[e] = acc
     end
@@ -297,11 +301,11 @@ function pv_flux!(out::EdgeField, F::EdgeField, q::VertexField,
 end
 
 """
-    pv_flux(F::EdgeField, q::VertexField) -> EdgeField
+    pv_flux(q::VertexField, F::EdgeField) -> EdgeField
 
 Allocating version of [`pv_flux!`](@ref).
 """
-pv_flux(F::EdgeField, q::VertexField) =
-    pv_flux!(similar_field(F), F, q, similar_field(F))
+pv_flux(q::VertexField, F::EdgeField) =
+    pv_flux!(similar_field(F), q, F, similar_field(F))
 
 end # module TRiSK
