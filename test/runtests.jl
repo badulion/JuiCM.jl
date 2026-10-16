@@ -645,4 +645,5 @@ using Random
     include("validation_test.jl")
     include("ocean_vertical_test.jl")
     include("ocean_dynamics_test.jl")
+    include("ocean_tracer_test.jl")
 end

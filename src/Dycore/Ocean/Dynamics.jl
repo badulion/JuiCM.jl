@@ -88,6 +88,15 @@
 #     holds exactly, and the total volume follows the fast solver's
 #     flux-form continuity (conserved to round-off; Phase-1 SW mass
 #     conservation).
+#   tracers (T, S): advected inside the slow SSPRK by the flux-form
+#     upwind scheme (#32, OceanTracers) with the SAME layer fluxes the
+#     continuity uses — tracer and volume budgets are compatible by
+#     construction. The re-stretch remap keeps layer concentrations
+#     unchanged (the fast barotropic mode carries no tracer in the
+#     anomaly-form split — same approximation as the velocity split;
+#     the closure keeps a horizontally-uniform T(z) exact and its
+#     conservation error is second order in the anomalies; see
+#     OceanTracers module header).
 #
 # This is a Lie splitting: O(Δt_slow) splitting error per step. The
 # depth-mean Coriolis of ū is advanced by the fast solver only (the
@@ -126,6 +135,7 @@ using ..Layered: LayeredField, LayeredCellField, LayeredEdgeField, nlayers
 using ..Vertical: VerticalGrid
 using ..OceanVertical: ssh_from_thickness, layer_center_z
 using ..OceanEOS: AbstractOceanEOS, ocean_density, ocean_density!
+using ..OceanTracers: tracer_tendency!
 using ..ShallowWater: williamson_constants
 using ..Atmos: SWState, sw_step!
 using ..TimeStepping: ssprk3_step!, ssprk3_integrate!
@@ -151,10 +161,11 @@ abstraction 3, layered case):
   coordinate (z-star or simple-z) at the end of every
   [`ocean_step!`](@ref) using the fast mode's η, so the
   state-consistent surface Σ_k h_k − H0 agrees with `eta` exactly.
-- `T` — per-layer temperature [K or °C] (`LayeredCellField`)
-- `S` — per-layer salinity [psu] (`LayeredCellField`); **prognostic
-  slot with no dynamics in #30** (user-ratified): carried unchanged so
-  the Phase-4 EOS/physics plugs in without touching the state layout.
+- `T` — per-layer temperature [K or °C] (`LayeredCellField`); advected
+  by the flux-form upwind scheme (#32, [`tracer_tendency!`](@ref))
+  inside the slow step, with the same layer fluxes the continuity uses
+- `S` — per-layer salinity [psu] (`LayeredCellField`); advected exactly
+  like `T` (no sources/sinks yet — those are Phase-4 physics)
 - `eta` — free-surface height [m] (`CellField`), the *fast barotropic*
   prognostic (advanced with ū by substepped 2D SW solves)
 - `ubar` — barotropic (depth-mean) normal velocity [m/s] (`EdgeField`),
@@ -261,8 +272,9 @@ heights; `nothing` = the state-consistent diagnostic (Σ h_k − H0,
 identical at every stage of a split step by the column invariant).
 
 After this call `out` holds the physical-unit tendencies of
-(u, h, T, S); T and S have zero dynamical tendency in #30 (no tracer
-advection until #32 — their tendencies here are exactly zero), and
+(u, h, T, S); T and S are advected by the flux-form upwind scheme
+(#32) with the same layer fluxes the continuity uses (compatibility by
+construction — see `OceanTracers`), and
 `eta`/`ubar` have zero tendency (they are advanced by the fast solver
 at the driver level, not inside the slow SSPRK).
 
@@ -389,10 +401,13 @@ function ocean_tendency!(out::OceanState, state::OceanState;
         axpy!(out.u[k], 1.0, cors[k])
     end
 
-    # T and S: zero dynamical tendency in #30 (tracers arrive with #32);
+    # T and S: advected by the flux-form upwind scheme (issue #32) with
+    # the SAME layer fluxes the continuity just used (compatibility by
+    # construction — Tracers.jl module header); the continuity tendency
+    # out.h is passed in so the product-rule closure matches exactly.
     # eta/ubar: zero slow tendency (advanced by the fast solver)
-    fill!(out.T, 0.0)
-    fill!(out.S, 0.0)
+    tracer_tendency!(out.T, state.T, state.h, state.u; dhdt = out.h)
+    tracer_tendency!(out.S, state.S, state.h, state.u; dhdt = out.h)
     fill!(out.eta, 0.0)
     fill!(out.ubar, 0.0)
     return out
@@ -417,7 +432,9 @@ Advance one mode-split step of Δt [s] (single-region state):
 3. **coupling**: replace the layers' depth-mean with the fast
    solver's ū_end (`u_k = u′_k + ū_end`), re-stretch the column to the
    coordinate map with the time-mean fast η, and store (η̄, ū_end)
-   back into the state (see module header).
+   back into the state (see module header). Layer tracers `T`/`S` ride
+   the slow SSPRK (upwind advection, #32); the re-stretch keeps their
+   concentrations unchanged (module header, "tracers").
 
 Split scheme documented in the module header (Lie splitting,
 MPAS-O-flavored barotropic/baroclinic split).

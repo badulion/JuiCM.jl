@@ -14,6 +14,7 @@ include("Benchmarks/ShallowWater/ShallowWater.jl")
 include("TimeStepping/SSPRK.jl")
 include("Dycore/Ocean/Vertical.jl")
 include("Dycore/Ocean/EOS.jl")
+include("Dycore/Ocean/Tracers.jl")
 include("Dycore/Atmos/Dynamics.jl")
 include("Dycore/Ocean/Dynamics.jl")
 
@@ -46,6 +47,7 @@ using .OceanVertical: zstar_stretch_factor, interface_z, layer_thickness,
                       vertical_neighbors
 using .OceanEOS: AbstractOceanEOS, LinearEOS, ocean_density,
                  ocean_density!
+using .OceanTracers: tracer_tendency!, advect_tracer!, tracer_total
 using .Atmos: SWState, sw_step!
 using .Ocean: OceanState, ocean_state, ocean_tendency!, ocean_step!,
               ocean_integrate!, ocean_volume, ocean_kinetic_energy,
@@ -67,6 +69,7 @@ export VoronoiSphereMesh, generate_icosahedral_mesh, Field,
        bathymetry_shelf_break, regrid_zstar, effective_layer_counts,
        thickness_from_ssh, vertical_neighbors,
        AbstractOceanEOS, LinearEOS, ocean_density, ocean_density!,
+       tracer_tendency!, advect_tracer!, tracer_total,
        OceanState, ocean_state, ocean_tendency!, ocean_step!,
        ocean_integrate!, ocean_volume, ocean_kinetic_energy, ocean_ssh,
        SWState, SWModel, sw_state, sw_model, AbstractPhysicsModule,
