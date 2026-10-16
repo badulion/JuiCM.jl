@@ -24,7 +24,8 @@ using ..Fields: Field, CellLoc, EdgeLoc, VertexLoc, location, mesh_of
 
 export MeshPartition, partition_mesh, n_regions, region_of, owned_indices,
        ghost_cells, HaloInfo, build_halo_info, HaloArray, halo_array,
-       HaloWorld, halo_world, halo_update!, partitioned_fields, owned_view
+       HaloWorld, halo_world, halo_update!, halo_exchange!,
+       partitioned_fields, owned_view
 
 # ------------------------------------------------------------- partitioning
 
@@ -325,6 +326,34 @@ function halo_world(info::HaloInfo; T = Float64, init = nothing,
 end
 
 """
+    halo_exchange!(arrays::Vector{<:HaloArray}) -> Vector
+
+Exchange ghosts **within a collection** of per-region arrays sharing one
+`HaloInfo`: every region's ghost slots are refreshed from the current
+owned values of the other arrays in the collection. This is the
+primitive the dycore uses per SSPRK stage — stage buffers are fresh
+`HaloArray`s, not the model's world arrays, so the exchange must target
+exactly the collection about to be read (owner-computes: every value
+read was written by its owner in the same stage).
+"""
+function halo_exchange!(arrays::Vector{A}) where {A <: HaloArray}
+    isempty(arrays) && return arrays
+    info = arrays[1].info
+    R = length(arrays)
+    for my in 1:R, s in 1:R
+        s == my && continue
+        recvlist = info.send[s][my]    # what s owns that I need
+        isempty(recvlist) && continue
+        dst = arrays[my].buf
+        src = arrays[s].buf
+        for g in recvlist
+            dst[g] = src[g]
+        end
+    end
+    return arrays
+end
+
+"""
     halo_update!(w::HaloWorld[, r]) -> HaloWorld
 
 Refresh ghost slots through the emulated pack → send → unpack pipeline.
@@ -372,8 +401,25 @@ halo_update!(w::HaloWorld) = (for r in 1:length(w.arrays)
                                   halo_update!(w, r)
                               end; w)
 
-# ------------------------------------------------------- Field integration
+"""
+    halo_exchange!(fields::Vector{<:Field}) -> Vector
 
+Field-level ghost exchange: extracts the `HaloArray` payloads and calls
+the array-level [`halo_exchange!`](@ref) on them (all fields must share
+one `HaloInfo`). This is the form the dycore uses per SSPRK stage —
+stage buffers are fresh Fields wrapping fresh `HaloArray`s, so the
+exchange must target exactly the collection about to be read
+(owner-computes: every value read was written by its owner in the same
+stage).
+"""
+function halo_exchange!(fields::Vector{<:Field})
+    isempty(fields) && return fields
+    arrays = [f.data for f in fields]
+    halo_exchange!(arrays)
+    return fields
+end
+
+# ------------------------------------------------------- Field integration
 """
     partitioned_fields(f::Field, info::HaloInfo) -> Vector{Field}
 
@@ -401,5 +447,18 @@ end
 View of the region's owned slots (for reductions and output).
 """
 owned_view(a::HaloArray) = view(a.buf, a.info.owned[a.region])
+
+# Field integration: partitioned payload support for the Field kernels.
+# In global index space the elementwise kernels are correct as-is; only
+# reductions must skip non-owned slots (ghosts are stale copies, deeper
+# slots NaN-poisoned).
+
+"""
+    valid_indices(a::HaloArray) -> view
+
+The region's owned slots — the reduction domain for a partitioned
+payload (see [`Fields.valid_indices`](@ref)).
+"""
+valid_indices(a::HaloArray) = owned_view(a)
 
 end # module Halo
