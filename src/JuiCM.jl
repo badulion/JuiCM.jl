@@ -15,6 +15,7 @@ include("TimeStepping/SSPRK.jl")
 include("Dycore/Ocean/Vertical.jl")
 include("Dycore/Ocean/EOS.jl")
 include("Dycore/Ocean/Tracers.jl")
+include("Dycore/Ocean/TracerFCT.jl")
 include("Dycore/Atmos/Dynamics.jl")
 include("Dycore/Ocean/Dynamics.jl")
 
@@ -24,7 +25,8 @@ using .Fields: Field, CellField, EdgeField, VertexField
 using .Layered: LayeredField, LayeredCellField, LayeredEdgeField, nlayers
 using .Vertical: VerticalGrid, zstar_thicknesses
 using .TRiSK: divergence, gradient, curl, tangential_flux, edge_mean,
-              kinetic_energy, pv_flux, relative_vorticity
+              kinetic_energy, pv_flux, relative_vorticity, divergence!,
+              cell_gradient
 using .Halo: MeshPartition, partition_mesh, n_regions, region_of,
              owned_indices, HaloInfo, build_halo_info, HaloArray,
              halo_array, HaloWorld, halo_world, halo_update!,
@@ -48,6 +50,7 @@ using .OceanVertical: zstar_stretch_factor, interface_z, layer_thickness,
 using .OceanEOS: AbstractOceanEOS, LinearEOS, ocean_density,
                  ocean_density!
 using .OceanTracers: tracer_tendency!, advect_tracer!, tracer_total
+using .TracerFCT: fct_advect_tracer!
 using .Atmos: SWState, sw_step!
 using .Ocean: OceanState, ocean_state, ocean_tendency!, ocean_step!,
               ocean_integrate!, ocean_volume, ocean_kinetic_energy,
@@ -59,7 +62,8 @@ export VoronoiSphereMesh, generate_icosahedral_mesh, Field,
        VerticalGrid, zstar_thicknesses,
        mesh_summary, adjacency_consistent, kite_uniformity,
        divergence, gradient, curl, tangential_flux, edge_mean,
-       kinetic_energy, pv_flux, relative_vorticity,
+       kinetic_energy, pv_flux, relative_vorticity, divergence!,
+       cell_gradient,
        partition_mesh, halo_world, halo_update!, halo_exchange!,
        partitioned_fields, owned_view,
        zstar_stretch_factor, interface_z, layer_thickness,
@@ -70,6 +74,7 @@ export VoronoiSphereMesh, generate_icosahedral_mesh, Field,
        thickness_from_ssh, vertical_neighbors,
        AbstractOceanEOS, LinearEOS, ocean_density, ocean_density!,
        tracer_tendency!, advect_tracer!, tracer_total,
+       fct_advect_tracer!,
        OceanState, ocean_state, ocean_tendency!, ocean_step!,
        ocean_integrate!, ocean_volume, ocean_kinetic_energy, ocean_ssh,
        SWState, SWModel, sw_state, sw_model, AbstractPhysicsModule,
