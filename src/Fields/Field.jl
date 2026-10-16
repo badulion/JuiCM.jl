@@ -27,7 +27,7 @@ import LinearAlgebra: dot
 export Field, CellField, EdgeField, VertexField,
        CellLoc, EdgeLoc, VertexLoc, FieldLocation,
        location, mesh_of, similar_field, length_of,
-       lincomb!, axpy!, similar_state, scale!, dot, valid_indices
+       lincomb!, axpy!, similar_state, scale!, rdivide!, dot, valid_indices
 """Location of field data on the mesh (TRiSK staggering)."""
 abstract type FieldLocation end
 
@@ -304,6 +304,22 @@ metadata preserved).
 """
 Base.copy(f::Field{M, T, N, AX, L}) where {M, T, N, AX, L} =
     copyto!(similar_field(f), f)
+
+"""
+    rdivide!(out::Field, A::Field, B::Field) -> Field
+
+`out .= A ./ B` elementwise, same location constraints as
+[`lincomb!`](@ref) (payload type preserved — no broadcast). `out` may
+alias `A` or `B` (single loop, per-index read-then-write).
+"""
+function rdivide!(out::Field{M, T, N, AX, L},
+                  A::Field{M, T, N, AX2, L},
+                  B::Field{M, T, N, AX3, L}) where {M, T, N, AX, AX2, AX3, L}
+    @inbounds for i in eachindex(out.data)
+        out.data[i] = A.data[i] / B.data[i]
+    end
+    return out
+end
 
 """
     valid_indices(f::Field) -> index collection

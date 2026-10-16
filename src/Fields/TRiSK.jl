@@ -25,6 +25,7 @@ export divergence, divergence!, gradient, gradient!,
        curl, curl!, tangential_flux, tangential_flux!,
        edge_mean, edge_mean!, kinetic_energy, kinetic_energy!,
        pv_flux, pv_flux!, potential_vorticity, potential_vorticity!,
+       upwind_flux, upwind_flux!,
        integral, relative_vorticity, relative_vorticity!
 
 # ------------------------------------------------------------- divergence
@@ -356,6 +357,52 @@ Allocating version of [`potential_vorticity!`](@ref).
 potential_vorticity(u::EdgeField, h::CellField,
                     f::Union{Nothing, VertexField} = nothing) =
     potential_vorticity!(similar_field(h, eltype(h), VertexLoc()), u, h, f)
+
+# ---------------------------------------------------------- upwind flux
+
+"""
+    upwind_flux!(out::EdgeField, u::EdgeField, h::CellField,
+                 C::CellField) -> EdgeField
+
+First-order upwind tracer flux through edges (flux-form advection, R10
+§2.4; the *same* edge thickness transport the layer continuity uses,
+with the tracer concentration taken from the upwind cell — issue #32):
+
+    (C·F)_e = u_e · h̄_e · (C_i  if u_e > 0,  C_j  otherwise)
+
+with `i, j = edge_cells[:, e]` and `h̄_e = (h_i + h_j)/2` the edge
+thickness (R10 Eq 52, the same `F_e = ĥ_e u_e` as the volume flux).
+Writing the tracer flux as the thickness flux times the upwind
+concentration makes the tracer transport *compatible* with the volume
+transport by construction: a constant tracer is advected unchanged by
+any flow (the tracer budget is the volume budget wherever C is
+uniform), and the resulting scheme is positive — a monotone C-field
+stays monotone (barrier at the neighbor min/max).
+
+`out` must not alias `C` (the operator reads the flanking cells'
+concentrations while writing `out`); aliasing is an `ArgumentError`.
+See [`upwind_flux`](@ref) for the allocating version.
+"""
+function upwind_flux!(out::EdgeField, u::EdgeField, h::CellField,
+                      C::CellField)
+    mesh = u.mesh
+    out.data === C.data &&
+        throw(ArgumentError("upwind_flux!: out must not alias C"))
+    for e in 1:mesh.n_edges
+        i, j = mesh.edge_cells[1, e], mesh.edge_cells[2, e]
+        F = u.data[e] * (h.data[i] + h.data[j]) / 2
+        out.data[e] = F * (u.data[e] > 0 ? C.data[i] : C.data[j])
+    end
+    return out
+end
+
+"""
+    upwind_flux(u::EdgeField, h::CellField, C::CellField) -> EdgeField
+
+Allocating version of [`upwind_flux!`](@ref).
+"""
+upwind_flux(u::EdgeField, h::CellField, C::CellField) =
+    upwind_flux!(similar_field(u), u, h, C)
 
 """
     integral(f::Union{CellField, EdgeField}) -> Real
