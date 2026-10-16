@@ -643,4 +643,5 @@ using Random
     include("time_stepping_test.jl")
     include("dycore_sw_test.jl")
     include("validation_test.jl")
+    include("ocean_vertical_test.jl")
 end
