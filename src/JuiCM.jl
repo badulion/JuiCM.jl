@@ -36,7 +36,11 @@ using .Atmos: SWState, SWModel, sw_state, sw_model, AbstractPhysicsModule,
               sw_integrate!, sw_mass, sw_total_energy
 using .OceanVertical: zstar_stretch_factor, interface_z, layer_thickness,
                       layer_center_z, dz_interfaces, interp_to_interfaces,
-                      ssh_from_thickness
+                      ssh_from_thickness, bathymetry_flat,
+                      bathymetry_channel, bathymetry_slope,
+                      bathymetry_shelf_break, regrid_zstar,
+                      effective_layer_counts, thickness_from_ssh,
+                      vertical_neighbors
 
 export VoronoiSphereMesh, generate_icosahedral_mesh, Field,
        CellField, EdgeField, VertexField,
@@ -50,6 +54,9 @@ export VoronoiSphereMesh, generate_icosahedral_mesh, Field,
        zstar_stretch_factor, interface_z, layer_thickness,
        layer_center_z, dz_interfaces, interp_to_interfaces,
        ssh_from_thickness, nlayers,
+       bathymetry_flat, bathymetry_channel, bathymetry_slope,
+       bathymetry_shelf_break, regrid_zstar, effective_layer_counts,
+       thickness_from_ssh, vertical_neighbors,
        SWState, SWModel, sw_state, sw_model, AbstractPhysicsModule,
        compute_tendency!, NullForcing, sw_tendency!, sw_step!,
        sw_integrate!, sw_mass, sw_total_energy,
