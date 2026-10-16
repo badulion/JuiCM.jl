@@ -644,4 +644,5 @@ using Random
     include("dycore_sw_test.jl")
     include("validation_test.jl")
     include("ocean_vertical_test.jl")
+    include("ocean_dynamics_test.jl")
 end
