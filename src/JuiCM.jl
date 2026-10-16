@@ -7,14 +7,19 @@ include("Mesh/Voronoi.jl")
 include("Fields/Field.jl")
 include("Fields/TRiSK.jl")
 include("Fields/Halo.jl")
+include("Fields/Layered.jl")
+include("Mesh/Vertical.jl")
 include("Diagnostics/ErrorNorms.jl")
 include("Benchmarks/ShallowWater/ShallowWater.jl")
 include("TimeStepping/SSPRK.jl")
+include("Dycore/Ocean/Vertical.jl")
 include("Dycore/Atmos/Dynamics.jl")
 
 using .Voronoi: VoronoiSphereMesh, generate_icosahedral_mesh,
                 mesh_summary, adjacency_consistent, kite_uniformity
 using .Fields: Field, CellField, EdgeField, VertexField
+using .Layered: LayeredField, LayeredCellField, LayeredEdgeField, nlayers
+using .Vertical: VerticalGrid, zstar_thicknesses
 using .TRiSK: divergence, gradient, curl, tangential_flux, edge_mean,
               kinetic_energy, pv_flux, relative_vorticity
 using .Halo: MeshPartition, partition_mesh, n_regions, region_of,
@@ -29,14 +34,22 @@ using .TimeStepping: ssprk3_step!, ssprk3_integrate!, rk4_step!, rk4_integrate!
 using .Atmos: SWState, SWModel, sw_state, sw_model, AbstractPhysicsModule,
               compute_tendency!, NullForcing, sw_tendency!, sw_step!,
               sw_integrate!, sw_mass, sw_total_energy
+using .OceanVertical: zstar_stretch_factor, interface_z, layer_thickness,
+                      layer_center_z, dz_interfaces, interp_to_interfaces,
+                      ssh_from_thickness
 
 export VoronoiSphereMesh, generate_icosahedral_mesh, Field,
        CellField, EdgeField, VertexField,
+       LayeredField, LayeredCellField, LayeredEdgeField,
+       VerticalGrid, zstar_thicknesses,
        mesh_summary, adjacency_consistent, kite_uniformity,
        divergence, gradient, curl, tangential_flux, edge_mean,
        kinetic_energy, pv_flux, relative_vorticity,
        partition_mesh, halo_world, halo_update!, halo_exchange!,
        partitioned_fields, owned_view,
+       zstar_stretch_factor, interface_z, layer_thickness,
+       layer_center_z, dz_interfaces, interp_to_interfaces,
+       ssh_from_thickness, nlayers,
        SWState, SWModel, sw_state, sw_model, AbstractPhysicsModule,
        compute_tendency!, NullForcing, sw_tendency!, sw_step!,
        sw_integrate!, sw_mass, sw_total_energy,
