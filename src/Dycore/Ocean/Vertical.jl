@@ -37,6 +37,7 @@ using ..Voronoi: VoronoiSphereMesh
 
 export zstar_stretch_factor, interface_z, layer_thickness, layer_center_z,
        dz_interfaces, interp_to_interfaces, ssh_from_thickness,
+       simplez_center_depths,
        bathymetry_flat, bathymetry_channel, bathymetry_slope,
        bathymetry_shelf_break, regrid_zstar, effective_layer_counts,
        thickness_from_ssh, vertical_neighbors
@@ -77,15 +78,32 @@ a `CellField` gives per-cell bathymetry (#49). `eta` may be a
 uniform-elevation form always uses flat H0).
 """
 function interface_z(grid::VerticalGrid, eta::CellField)
-    return interface_z(grid, eta, CellField(i -> grid.H0, mesh_of(eta)))
+    # flat reference depth (grid.H0); :simplez mode handled inside the
+    # Real-H method
+    return interface_z(grid, eta, grid.H0)
 end
 function interface_z(grid::VerticalGrid, eta::CellField, H::Real)
+    if grid.mode == :simplez
+        # fixed-depth levels: z_k = −f_k·H0 for every η (flat bottom;
+        # entry 1 = f_1 = 0 would be the fixed 0 level, but the true
+        # free surface z = η must stay the top boundary — see below)
+        (; H0, zstar_fractions) = grid
+        m = mesh_of(eta)
+        z = CellField[]
+        push!(z, CellField(i -> eta[i], m))         # k = 1: free surface
+        for k in 2:length(zstar_fractions)
+            push!(z, CellField(i -> -zstar_fractions[k] * H0, m))
+        end
+        return z
+    end
     (; zstar_fractions) = grid
     m = mesh_of(eta)
     return [CellField(i -> eta[i] - f * (H + eta[i]), m)
             for f in zstar_fractions]
 end
 function interface_z(grid::VerticalGrid, eta::CellField, H::CellField)
+    grid.mode == :simplez && throw(ArgumentError(
+        ":simplez is flat-bottom only — pass H as a Real"))
     (; zstar_fractions) = grid
     m = mesh_of(eta)
     mesh_of(H) == m ||
@@ -116,13 +134,23 @@ together with the target `mesh` (the uniform-elevation form always uses
 flat H0).
 """
 function layer_thickness(grid::VerticalGrid, eta::CellField)
-    return layer_thickness(grid, eta,
-                           CellField(i -> grid.H0, mesh_of(eta)))
+    # flat reference depth (grid.H0); :simplez mode handled inside the
+    # Real-H method
+    return layer_thickness(grid, eta, grid.H0)
 end
 function layer_thickness(grid::VerticalGrid, eta::CellField, H::Real)
     (; zstar_fractions) = grid
     m = mesh_of(eta)
     K = nlayers(grid)
+    if grid.mode == :simplez
+        # fixed-depth levels: h_k = Δz*_k for k ≥ 2; the top layer
+        # absorbs the free-surface displacement, h_1 = Δz*_1 + η
+        return LayeredCellField((i, k) ->
+            k == 1 ? (zstar_fractions[2] - zstar_fractions[1]) * H +
+                     eta[i]
+                   : (zstar_fractions[k + 1] - zstar_fractions[k]) * H,
+            m, K)
+    end
     return LayeredCellField((i, k) ->
         (zstar_fractions[k + 1] - zstar_fractions[k]) * (H + eta[i]),
         m, K)
@@ -158,7 +186,7 @@ with `interface_z`'s indexing (layer k lies between interfaces k and
 k + 1).
 """
 function layer_center_z(grid::VerticalGrid, eta::CellField)
-    zi = interface_z(grid, eta)
+    zi = interface_z(grid, eta, grid.H0)
     m = mesh_of(eta)
     K = nlayers(grid)
     return LayeredCellField((i, k) -> (zi[k][i] + zi[k + 1][i]) / 2, m, K)
@@ -264,6 +292,28 @@ function ssh_from_thickness(grid::VerticalGrid, h::LayeredCellField,
     mesh_of(H) == m ||
         throw(ArgumentError("h and H must live on the same mesh"))
     return CellField(i -> sum(h[k][i] for k in 1:nlayers(h)) - H[i], m)
+end
+
+# ------------------------------------------- simple-z interface pressure
+#
+# For the :simplez coordinate the interfaces are at fixed depths
+# z_k = −f_k·H0, so the vertical-coordinate contribution to the PGF is
+# static: the layer-center depths are z_c,k = −(f_k + f_{k+1})·H0/2.
+# The z-star mode has no such table (its interfaces move with η); see
+# Dynamics for how the two modes enter the pressure-gradient split.
+
+"""
+    simplez_center_depths(grid) -> Vector{Float64}
+
+Fixed layer-center depths [m, negative] of the `:simplez` coordinate:
+z_c,k = −(f_k + f_{k+1})·H0 / 2. Only defined for `mode == :simplez`.
+"""
+function simplez_center_depths(grid::VerticalGrid)
+    grid.mode == :simplez || throw(ArgumentError(
+        "simplez_center_depths requires mode = :simplez"))
+    (; H0, zstar_fractions) = grid
+    return [-(zstar_fractions[k] + zstar_fractions[k + 1]) * H0 / 2
+            for k in 1:nlayers(grid)]
 end
 
 # ------------------------------------------------------ bathymetry (#49)
