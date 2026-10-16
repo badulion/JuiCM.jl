@@ -17,13 +17,15 @@ module TRiSK
 using LinearAlgebra
 
 using ..Fields: Field, CellField, EdgeField, VertexField,
-                similar_field
+                CellLoc, EdgeLoc, VertexLoc,
+                similar_field, valid_indices
 using ..Voronoi: VoronoiSphereMesh
 
 export divergence, divergence!, gradient, gradient!,
        curl, curl!, tangential_flux, tangential_flux!,
        edge_mean, edge_mean!, kinetic_energy, kinetic_energy!,
-       pv_flux, pv_flux!, relative_vorticity, relative_vorticity!
+       pv_flux, pv_flux!, potential_vorticity, potential_vorticity!,
+       integral, relative_vorticity, relative_vorticity!
 
 # ------------------------------------------------------------- divergence
 
@@ -56,7 +58,7 @@ end
 
 Allocating version of [`divergence!`](@ref).
 """
-divergence(F::EdgeField) = divergence!(CellField(F.mesh, eltype(F)), F)
+divergence(F::EdgeField) = divergence!(similar_field(F, eltype(F), CellLoc()), F)
 
 # --------------------------------------------------------------- gradient
 
@@ -85,7 +87,7 @@ end
 
 Allocating version of [`gradient!`](@ref).
 """
-gradient(h::CellField) = gradient!(EdgeField(h.mesh, eltype(h)), h)
+gradient(h::CellField) = gradient!(similar_field(h, eltype(h), EdgeLoc()), h)
 
 # ------------------------------------------------------------------- curl
 
@@ -198,7 +200,7 @@ end
 
 Allocating version of [`edge_mean!`](@ref).
 """
-edge_mean(h::CellField) = edge_mean!(EdgeField(h.mesh, eltype(h)), h)
+edge_mean(h::CellField) = edge_mean!(similar_field(h, eltype(h), EdgeLoc()), h)
 
 """
     edge_mean!(out::EdgeField, q::VertexField) -> EdgeField
@@ -221,7 +223,7 @@ end
 
 Allocating version of the vertex→edge mean (R10 Eq 50).
 """
-edge_mean(q::VertexField) = edge_mean!(EdgeField(q.mesh, eltype(q)), q)
+edge_mean(q::VertexField) = edge_mean!(similar_field(q, eltype(q), EdgeLoc()), q)
 
 # -------------------------------------------------------- kinetic energy
 
@@ -253,7 +255,7 @@ end
 
 Allocating version of [`kinetic_energy!`](@ref).
 """
-kinetic_energy(u::EdgeField) = kinetic_energy!(CellField(u.mesh, eltype(u)), u)
+kinetic_energy(u::EdgeField) = kinetic_energy!(similar_field(u, eltype(u), CellLoc()), u)
 
 # --------------------------------------------------------------- PV flux
 
@@ -307,5 +309,82 @@ Allocating version of [`pv_flux!`](@ref).
 """
 pv_flux(q::VertexField, F::EdgeField) =
     pv_flux!(similar_field(F), q, F, similar_field(F))
+
+# --------------------------------------------------- potential vorticity
+
+"""
+    potential_vorticity!(out::VertexField, u::EdgeField, h::CellField,
+                         f::Union{Nothing, VertexField} = nothing) -> VertexField
+
+Absolute potential vorticity at vertices (R10 §2.4):
+
+    q_v = (f_v + ζ_v) / h_v,     ζ = ∇×u   (R10 Eq 23)
+
+with `h_v` the equal-distribution (normalized inverse-corner-count)
+cell-thickness interpolation — the weights `R_{i,v}` normalized to sum
+to one over the cells surrounding each vertex:
+
+    h_v = Σ_i (h_i / n_i) / Σ_i (1 / n_i)
+
+(`n_i` = corner count of cell `i`; pentagons weight 1/5 vs 1/6 for
+hexagons.) `f = nothing` gives relative PV `ζ / h_v`. `out` must be a
+`VertexField` on the same mesh.
+"""
+function potential_vorticity!(out::VertexField, u::EdgeField, h::CellField,
+                              f::Union{Nothing, VertexField} = nothing)
+    mesh = h.mesh
+    ζ = curl(u)
+    for v in 1:mesh.n_vertices
+        num = 0.0
+        den = 0.0
+        for c in mesh.vertex_cells[v]
+            nck = 1 / length(mesh.cell_corners[c])
+            num += nck * h.data[c]
+            den += nck
+        end
+        fv = f === nothing ? 0.0 : f.data[v]
+        out.data[v] = (fv + ζ.data[v]) / (num / den)
+    end
+    return out
+end
+
+"""
+    potential_vorticity(u::EdgeField, h::CellField[, f]) -> VertexField
+
+Allocating version of [`potential_vorticity!`](@ref).
+"""
+potential_vorticity(u::EdgeField, h::CellField,
+                    f::Union{Nothing, VertexField} = nothing) =
+    potential_vorticity!(similar_field(h, eltype(h), VertexLoc()), u, h, f)
+
+"""
+    integral(f::Union{CellField, EdgeField}) -> Real
+
+Global area-weighted integral of a field over the unit sphere: for a
+`CellField` the weights are the cell areas `A_i`; for an `EdgeField`
+the edge areas `A_e = l_e d_e` (R10 Eq 48). On a partitioned payload
+only the region's owned slots enter (see
+[`Fields.valid_indices`](@ref)) — ghosts are copies and deeper slots
+are NaN-poisoned, so the result equals the single-region integral in
+both cases. (The mesh geometry lives on the unit sphere; multiply by
+`R²` for physical units.)
+"""
+function integral(f::CellField)
+    mesh = f.mesh
+    s = zero(eltype(f))
+    for i in valid_indices(f)
+        s += f.data[i] * mesh.cell_area[i]
+    end
+    return s
+end
+
+function integral(f::EdgeField)
+    mesh = f.mesh
+    s = zero(eltype(f))
+    for e in valid_indices(f)
+        s += f.data[e] * mesh.l_e[e] * mesh.d_e[e]
+    end
+    return s
+end
 
 end # module TRiSK

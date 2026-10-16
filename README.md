@@ -67,7 +67,12 @@ Details and pass criteria: [DESIGN.md §4](DESIGN.md).
   Thuburn et al. (2009)'s defining identities. Mesh visualization and the
   quality suite are in `docs/` and `test/`. ✅
 - **Phase 1 (shallow water):** TRiSK operators, halo exchange, SSPRK
-  time stepping, and the Williamson validation suite — in progress.
+  time stepping, and the shallow-water dynamical core — the dycore runs
+  partitioned (owner-computes, ghost exchange once per SSPRK stage) and
+  is bitwise identical to the single-region run. Williamson case 2
+  conserves mass to round-off and total energy to time-truncation level,
+  with case-2 error norms in the published range for the resolution
+  class. Validation suite (cases 3/5/6) in progress.
 
 ## Documentation
 
