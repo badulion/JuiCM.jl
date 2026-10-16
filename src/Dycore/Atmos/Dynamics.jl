@@ -156,7 +156,8 @@ compute_tendency!(tend::SWState, state::SWState, ::NullForcing, t) = tend
 # ------------------------------------------------------------ tendency
 
 """
-    sw_tendency!(out::SWState, state::SWState; physics = NullForcing(), t = 0.0)
+    sw_tendency!(out::SWState, state::SWState; physics = NullForcing(),
+                 topography = nothing, t = 0.0)
         -> SWState
 
 Shallow-water dynamical tendency (R10 Eqs 16 and 20) plus the optional
@@ -173,6 +174,13 @@ the scaled-variable assembly):
 `out` holds the physical-unit tendencies; the physics hook
 (`compute_tendency!`) then adds its forcing into the same buffers.
 
+Topography (`topography::CellField`, bottom height `b` [m]; `nothing`
+= flat bottom): the momentum pressure gradient is of the free-surface
+geopotential, ∇(g(h + b) + K), while PV and the continuity flux use the
+fluid thickness `h` (standard vector-invariant SWE with bottom
+topography; R10 §2b). Williamson case 5 (zonal flow over an isolated
+mountain) requires this. With flat bottom the code path is unchanged.
+
 Sign note: `pv_flux` returns Q̂⊥ with the symmetric-q̃ form; R10 Eq 20's
 momentum term is −q̂F⊥ − ∇(gh+K), so the u-tendency uses
 `−Q̂⊥ − ∇(gh+K)`. Verified against the case-2 steady state (the #9
@@ -183,6 +191,7 @@ Requires all of `state`'s ghost slots to be current (call
 """
 function sw_tendency!(out::SWState, state::SWState;
                       physics::AbstractPhysicsModule = NullForcing(),
+                      topography = nothing,
                       t::Real = 0.0)
     mesh = mesh_of(state.h)
     (; R, Omega, g) = williamson_constants()
@@ -205,6 +214,12 @@ function sw_tendency!(out::SWState, state::SWState;
     Cor = pv_flux(q, Fu)                 # R10 Eq 49 (symmetric form)
     K = kinetic_energy(us)               # R10 Eq 63
     PhiK = lincomb!(similar_field(hs), g / R, hs, 1.0, K)   # [1/s²]
+    if topography !== nothing
+        # free-surface geopotential: g(h + b) → scaled g(h*/R + b*/R);
+        # b is a CellField payload-compatible with hs (same mesh/location)
+        bs = scale!(copyto!(similar_field(hs), topography), 1 / R)
+        lincomb!(PhiK, 1.0, PhiK, g / R, bs)
+    end
     du = gradient(PhiK)                  # R10 Eq 22
     lincomb!(out.u, -1.0, Cor, -1.0, du) # out.u = −Q̂⊥ − ∇(Φ+K)  (R10 Eq 20)
     scale!(out.u, R)                     # [m/s²]
@@ -251,31 +266,37 @@ end
 # ------------------------------------------------------------ drivers
 
 """
-    sw_step!(state::SWState, t, Δt; physics = NullForcing()) -> SWState
+    sw_step!(state::SWState, t, Δt; physics = NullForcing(),
+             topography = nothing) -> SWState
 
 Advance one SSPRK(3,3) step (single-region state; no exchange).
 """
 function sw_step!(state::SWState, t, Δt;
-                  physics::AbstractPhysicsModule = NullForcing())
-    L(out, s, τ) = sw_tendency!(out, s; physics = physics)
+                  physics::AbstractPhysicsModule = NullForcing(),
+                  topography = nothing)
+    L(out, s, τ) = sw_tendency!(out, s; physics = physics,
+                                topography = topography)
     return ssprk3_step!(L, state, t, Δt)
 end
 
 """
-    sw_integrate!(state::SWState, t0, t_final, n_steps; physics = NullForcing())
-        -> SWState
+    sw_integrate!(state::SWState, t0, t_final, n_steps; physics = NullForcing(),
+                  topography = nothing) -> SWState
 
 Integrate a single-region state with SSPRK(3,3) over `n_steps` equal
 steps.
 """
 function sw_integrate!(state::SWState, t0, t_final, n_steps;
-                       physics::AbstractPhysicsModule = NullForcing())
-    L(out, s, τ) = sw_tendency!(out, s; physics = physics)
+                       physics::AbstractPhysicsModule = NullForcing(),
+                       topography = nothing)
+    L(out, s, τ) = sw_tendency!(out, s; physics = physics,
+                                topography = topography)
     return ssprk3_integrate!(L, state, t0, t_final, n_steps)
 end
 
 """
-    sw_step!(model::SWModel, t, Δt; physics = NullForcing()) -> SWModel
+    sw_step!(model::SWModel, t, Δt; physics = NullForcing(),
+             topography = nothing) -> SWModel
 
 Advance all regions one SSPRK(3,3) step **in lockstep**, exchanging
 ghosts once per stage — before each of the three L evaluations — so
@@ -288,7 +309,8 @@ Butcher tableau, same stage times) with `halo_update!` inserted before
 each L call.
 """
 function sw_step!(model::SWModel, t, Δt;
-                  physics::AbstractPhysicsModule = NullForcing())
+                  physics::AbstractPhysicsModule = NullForcing(),
+                  topography = nothing)
     (; states) = model
     R = length(states)
     u1 = _stage.(states)
@@ -301,7 +323,8 @@ function sw_step!(model::SWModel, t, Δt;
     function L(out, s, τ)
         exchange([x.h for x in s], [x.u for x in s])
         for r in 1:R
-            sw_tendency!(out[r], s[r]; physics = physics, t = τ)
+            sw_tendency!(out[r], s[r]; physics = physics,
+                         topography = topography, t = τ)
         end
         return nothing
     end

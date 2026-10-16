@@ -69,15 +69,20 @@ Details and pass criteria: [DESIGN.md §4](DESIGN.md).
 - **Phase 1 (shallow water):** TRiSK operators, halo exchange, SSPRK
   time stepping, and the shallow-water dynamical core — the dycore runs
   partitioned (owner-computes, ghost exchange once per SSPRK stage) and
-  is bitwise identical to the single-region run. Williamson case 2
-  conserves mass to round-off and total energy to time-truncation level,
-  with case-2 error norms in the published range for the resolution
-  class. Validation suite (cases 3/5/6) in progress.
+  is bitwise identical to the single-region run. The full Williamson
+  validation suite is green: case 2 (steady zonal flow, error norms in
+  the published range), case 5 (zonal flow over an isolated mountain,
+  with bottom topography in the momentum equation), and case 6
+  (Rossby–Haurwitz wave), plus grid-imprinting diagnostics — results in
+  [docs/validation.md](docs/validation.md). ✅
 
 ## Documentation
 
 - [DESIGN.md](DESIGN.md) — architecture, decisions D1–D9, validation
   ladder, phase plan. **Read this first.**
+- [docs/validation.md](docs/validation.md) — validation-ladder results
+  (rungs V0/V0.5/V1) with the measured norms next to the published
+  reference values.
 - [AGENTS.md](AGENTS.md) — workflow rules for AI agents (and humans)
   contributing to this repo: issues → branches → PRs, docs + tests
   before merge, local green tests as the merge gate.

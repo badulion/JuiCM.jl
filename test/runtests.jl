@@ -642,4 +642,5 @@ using Random
     include("williamson_ics_test.jl")
     include("time_stepping_test.jl")
     include("dycore_sw_test.jl")
+    include("validation_test.jl")
 end
