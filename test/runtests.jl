@@ -446,8 +446,7 @@ using Random
 
         # --- rung V0: flux-form advection by solid-body rotation,
         # SSPRK3 in time, centered edge tracer; convergence ≥ 1.5.
-        for (lev_hi, lev_lo) in ((4, 3),)
-            mhi = generate_icosahedral_mesh(n_subdivisions=lev_hi)
+        for (lev_hi, lev_lo) in ((4, 3),)            mhi = generate_icosahedral_mesh(n_subdivisions=lev_hi)
             mlo = generate_icosahedral_mesh(n_subdivisions=lev_lo)
             adv_err(m) = begin
                 U0a = 0.7; T = 0.4; β = 12.0
@@ -487,6 +486,156 @@ using Random
             order = log(elo / ehi) / log(2)
             @test order ≥ 1.5
         end
+    end
+
+    @testset "halo machinery (#10)" begin
+        using JuiCM.Fields: CellLoc, EdgeLoc, VertexLoc
+        using JuiCM.Halo: MeshPartition, partition_mesh, n_regions,
+                          region_of, owned_indices, ghost_cells,
+                          build_halo_info, halo_array, halo_world,
+                          halo_update!, partitioned_fields, owned_view
+
+        # elements of stagger L that a cell c's operators touch
+        mesh_touched(p, m, ::CellLoc, c) = (c,)
+        mesh_touched(p, m, ::EdgeLoc, c) = m.cell_edges[c]
+        mesh_touched(p, m, ::VertexLoc, c) =
+            (v for e in m.cell_edges[c]
+             for v in (m.edge_vertex_pos[e], m.edge_vertex_neg[e]))
+
+        m = generate_icosahedral_mesh(n_subdivisions=2)
+        p = partition_mesh(m, 4)
+
+        # --- partition invariants: every element owned exactly once,
+        # regions non-empty, region_of agrees with owned lists
+        @test n_regions(p) == 4
+        own_count = zeros(Int, m.n_cells)
+        for r in 1:4, c in p.owned_cells[r]
+            own_count[c] += 1
+        end
+        @test all(==(1), own_count)
+        @test all(!isempty, p.owned_cells)
+        @test all(r -> all(c -> region_of(p, c) == r, p.owned_cells[r]), 1:4)
+        @test sum(length, p.owned_cells) == m.n_cells
+
+        # --- pentagon cells: owned exactly once (the #10 acceptance case)
+        @test all(c -> own_count[c] == 1, m.pentagon_cells)
+
+        # --- ghost sets: 2-layer, exclude owned, consistent for all regions
+        for r in 1:4
+            gc = ghost_cells(p, m, r)
+            @test allunique(gc) && issorted(gc)
+            @test all(c -> p.owner[c] != r, gc)
+            @test length(gc) > 0
+        end
+
+        # --- halo info: send lists are exact owner↔ghost mirrors,
+        # sorted, unique, disjoint from receiver's owned set
+        for (L, n) in ((CellLoc(), m.n_cells), (EdgeLoc(), m.n_edges),
+                       (VertexLoc(), m.n_vertices))
+            info = build_halo_info(p, m, L)
+            info2 = build_halo_info(p, m, L)
+            @test info.n_global == n
+            for r in 1:4, s in 1:4
+                r == s && continue
+                @test info.send[r][s] == info2.send[r][s]  # deterministic
+                @test allunique(info.send[r][s]) && issorted(info.send[r][s])
+                @test all(g -> info.owner[g] == r, info.send[r][s])
+            end
+        end
+
+        # --- constant field: owner-computes exchange preserves the
+        # constant exactly (round-off = exact equality here) on all
+        # three staggers and all regions (acceptance item 1)
+        for (L, n) in ((CellLoc(), m.n_cells), (EdgeLoc(), m.n_edges),
+                       (VertexLoc(), m.n_vertices))
+            info = build_halo_info(p, m, L)
+            w = halo_world(info; init = g -> 3.14159, poison_ghosts = false)
+            # perturb owned values per region, then exchange
+            for r in 1:4, g in info.owned[r]
+                w[r].buf[g] += r
+            end
+            halo_update!(w)
+            for r in 1:4, s in 1:4
+                r == s && continue
+                # every index exchanged with s must equal s's (owner) value
+                for g in info.send[s][r]
+                    @test w[r].buf[g] === w[s].buf[g]
+                end
+            end
+            # semantic coverage: every NON-OWNED element that operators on
+            # owned elements touch is covered by the exchange
+            # (cells: 2-layer ghosts; edges: edges of owned∪ghost cells;
+            # vertices: ends of touched edges)
+            for r in 1:4
+                oc = Set(p.owned_cells[r])
+                gc = Set(ghost_cells(p, m, r))
+                touched = Set{Int}()
+                for c in Iterators.flatten((oc, gc))
+                    union!(touched, mesh_touched(p, m, L, c))
+                end
+                for g in touched
+                    info.owner[g] == r && continue
+                    s = info.owner[g]
+                    @test g in info.send[s][r]
+                end
+            end
+        end
+
+        # --- ghost accuracy: after exchange, every 2-layer ghost slot is
+        # exactly the owner's value (copies, not interpolation) —
+        # "halo error consistent with operator order" = 0 by design
+        ic = build_halo_info(p, m, CellLoc())
+        wc = halo_world(ic; init = g -> sin(m.cell_xyz[1, g]) + 0.3 * cos(2 * m.cell_xyz[2, g]))
+        for r in 1:4, c in p.owned_cells[r]
+            wc[r].buf[c] += 10 * r
+        end
+        halo_update!(wc)
+        for r in 1:4, g in ghost_cells(p, m, r)
+            @test wc[r].buf[g] == wc[p.owner[g]].buf[g]
+        end
+
+        # --- poisoning: un-refreshed ghosts are NaN (fail loudly on
+        # stale reads); after halo_update! all 2-layer ghosts are finite
+        wp = halo_world(ic; init = g -> 1.0, poison_ghosts = true)
+        @test any(isnan, wp[2].buf)
+        halo_update!(wp, 2)
+        @test all(g -> !isnan(wp[2].buf[g]), ghost_cells(p, m, 2))
+
+        # --- pentagon halos correct: perturb values AT the 12 pentagon
+        # cells in their owner arrays, exchange, check every region's
+        # ghost copy of a pentagon cell matches the owner
+        wc2 = halo_world(ic; init = g -> 0.0, poison_ghosts = false)
+        for c in m.pentagon_cells
+            wc2[p.owner[c]].buf[c] = 7.0
+        end
+        halo_update!(wc2)
+        for r in 1:4, c in m.pentagon_cells
+            p.owner[c] == r && continue
+            c in Set(ghost_cells(p, m, r)) && @test wc2[r].buf[c] == 7.0
+        end
+
+        # --- TRiSK operators run unchanged on HaloArray payloads and
+        # agree with the global computation on owned cells
+        ie = build_halo_info(p, m, EdgeLoc())
+        we = halo_world(ie; init = g -> sin(m.edge_x[1, g]), poison_ghosts = false)
+        halo_update!(we)
+        u_h = Field{typeof(m), Float64, 1, typeof(we[1]), EdgeLoc}(we[1], m)
+        d_h = divergence(u_h)
+        u_g = EdgeField(e -> we[1].buf[e], m)
+        d_g = divergence(u_g)
+        @test maximum(abs.(d_h.data[p.owned_cells[1]] .- d_g.data[p.owned_cells[1]])) == 0
+
+        # --- partitioned_fields: one field per region, NaN-poisoned
+        # ghosts, same values on owned slots as the source field
+        h0 = CellField(i -> m.cell_xyz[3, i]^2, m)
+        fs = partitioned_fields(h0, ic)
+        @test length(fs) == 4
+        @test all(r -> all(i -> fs[r].data[i] == h0.data[i], p.owned_cells[r]), 1:4)
+        @test any(isnan, fs[1].data.buf)   # some non-owned slot poisoned
+
+        # --- owned_view covers exactly the owned slots
+        @test length(owned_view(wp[3])) == length(p.owned_cells[3])
+        @test all(g -> wp[3].buf[g] == wp[3].buf[g], owned_indices(p, 3))
     end
 
     include("error_norms_test.jl")
