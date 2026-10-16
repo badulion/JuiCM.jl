@@ -25,7 +25,7 @@ export divergence, divergence!, gradient, gradient!,
        curl, curl!, tangential_flux, tangential_flux!,
        edge_mean, edge_mean!, kinetic_energy, kinetic_energy!,
        pv_flux, pv_flux!, potential_vorticity, potential_vorticity!,
-       upwind_flux, upwind_flux!,
+       upwind_flux, upwind_flux!, cell_gradient, cell_gradient!,
        integral, relative_vorticity, relative_vorticity!
 
 # ------------------------------------------------------------- divergence
@@ -403,6 +403,80 @@ Allocating version of [`upwind_flux!`](@ref).
 """
 upwind_flux(u::EdgeField, h::CellField, C::CellField) =
     upwind_flux!(similar_field(u), u, h, C)
+
+# ------------------------------------------------- cell gradient (LSQ)
+
+"""
+    cell_gradient!(gx::CellField, gy::CellField, gz::CellField,
+                   C::CellField) -> (gx, gy, gz)
+
+Cell-centered gradient of a cell scalar by per-cell least squares over
+the edge means (the reconstruction gradient used by the #36 FCT
+fluxes; the discrete analogue of MPAS-O's `gradCell` reconstruction
+— Ringler, Petersen, Jacobsen & Jones 2013 §2e):
+
+    minimize Σ_{e∈EC(i)} |(C̄_e − C_i) − g·d_e|²,   d_e = (x_j − x_i)/2
+
+with `C̄_e = (C_i + C_j)/2` the edge mean (R10 Eq 52) and `d_e` the
+chord half-vector toward the flanking cell. The normal equations
+`(Σ_e d_e d_eᵀ) g = Σ_e (C̄_e − C_i) d_e` are solved per cell with a
+3×3 symmetric solve.
+
+**Exact for linear fields** `C = c0 + g·x` on any cell (hexagons and
+the 12 pentagons alike): the edge mean of a linear field is its value
+at the chord midpoint, so `C̄_e − C_i = g·d_e` exactly — zero residual,
+and the solve recovers `g` to round-off. (The raw Green–Gauss sum is
+NOT exact on the sphere: ∮ C n̂ dl over a spherical polygon picks up
+the vector-area curvature term; the chord least-squares form avoids
+it by construction.)
+
+The three components are written into caller-provided `CellField`s
+(unit sphere: gradient per radian; multiply by 1/R for per meter).
+See [`cell_gradient`](@ref) for the allocating version.
+"""
+function cell_gradient!(gx::CellField, gy::CellField, gz::CellField,
+                        C::CellField)
+    mesh = C.mesh
+    for i in 1:mesh.n_cells
+        M11 = M12 = M13 = M22 = M23 = M33 = 0.0
+        b1 = b2 = b3 = 0.0
+        xi = (mesh.cell_xyz[1, i], mesh.cell_xyz[2, i],
+              mesh.cell_xyz[3, i])
+        for e in mesh.cell_edges[i]
+            j = mesh.edge_cells[1, e] == i ? mesh.edge_cells[2, e] :
+                mesh.edge_cells[1, e]
+            d1 = (mesh.cell_xyz[1, j] - xi[1]) / 2
+            d2 = (mesh.cell_xyz[2, j] - xi[2]) / 2
+            d3 = (mesh.cell_xyz[3, j] - xi[3]) / 2
+            dC = (C.data[j] - C.data[i]) / 2     # C̄_e − C_i
+            M11 += d1*d1; M12 += d1*d2; M13 += d1*d3
+            M22 += d2*d2; M23 += d2*d3; M33 += d3*d3
+            b1 += dC*d1; b2 += dC*d2; b3 += dC*d3
+        end
+        # symmetric 3×3 solve (cofactor method)
+        c11 =  M22*M33 - M23*M23; c12 = -(M12*M33 - M13*M23)
+        c13 =  M12*M23 - M13*M22
+        det = M11*c11 + M12*c12 + M13*c13
+        det == 0 && error("cell_gradient!: singular geometry at cell $i")
+        inv = 1 / det
+        g1 = inv*(c11*b1 + c12*b2 + c13*b3)
+        g2 = inv*(c12*b1 + (M11*M33 - M13*M13)*b2 +
+                  -(M11*M23 - M12*M13)*b3)
+        g3 = inv*(c13*b1 + -(M11*M23 - M12*M13)*b2 +
+                  (M11*M22 - M12*M12)*b3)
+        gx.data[i] = g1; gy.data[i] = g2; gz.data[i] = g3
+    end
+    return (gx, gy, gz)
+end
+
+"""
+    cell_gradient(C::CellField) -> Tuple{CellField, CellField, CellField}
+
+Allocating version of [`cell_gradient!`](@ref): returns the three
+unit-sphere components as a tuple of `CellField`s (x, y, z).
+"""
+cell_gradient(C::CellField) =
+    cell_gradient!(similar_field(C), similar_field(C), similar_field(C), C)
 
 """
     integral(f::Union{CellField, EdgeField}) -> Real
