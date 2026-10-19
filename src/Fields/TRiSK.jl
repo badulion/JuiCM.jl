@@ -26,7 +26,8 @@ export divergence, divergence!, gradient, gradient!,
        edge_mean, edge_mean!, kinetic_energy, kinetic_energy!,
        pv_flux, pv_flux!, potential_vorticity, potential_vorticity!,
        upwind_flux, upwind_flux!, cell_gradient, cell_gradient!,
-       integral, relative_vorticity, relative_vorticity!
+       integral, relative_vorticity, relative_vorticity!,
+       laplacian, laplacian!
 
 # ------------------------------------------------------------- divergence
 
@@ -507,5 +508,67 @@ function integral(f::EdgeField)
     end
     return s
 end
+
+# -------------------------------------------------- vector Laplacian (#40)
+
+"""
+    laplacian!(out::EdgeField, u::EdgeField) -> EdgeField
+
+Discrete (Hodge) vector Laplacian of a normal-velocity field at edge
+points, the C-grid `∇²u` of the horizontal momentum dissipation
+(R10 symmetric operator skeleton; MPAS `del2` form):
+
+    (∇²u)_e = ∇(∇·u)|_e − [k̂×∇ζ]_e
+            = (D_j − D_i)/d_e − (ζ_v1 − ζ_v2)/l_e
+
+with D = [`divergence`](@ref)(u) at the edge's cells i = cell 1,
+j = cell 2, ζ = [`curl`](@ref)(u) at its end vertices
+v1 = `edge_vertex_pos[e]`, v2 = `edge_vertex_neg[e]`. Lengths are on
+the unit sphere, so the result is in [u-units/rad²]; the caller
+divides by R² for physical units. `out` is overwritten; `u.mesh` is
+used.
+
+Properties (checked in `test/gravity_current_benchmark_test.jl`):
+- **negative semi-definite** in the TRiSK energy inner product
+  ⟨a, b⟩ = Σ_e l_e d_e a_e b_e: both terms are −(adjoint pair)
+  products, ⟨u, ∇²u⟩ = −Σ_i A_i D_i² − Σ_v A_v ζ_v² ≤ 0, so ν∇²u
+  never creates kinetic energy;
+- **rigid rotation is NOT in its kernel**: for u = Ω×r the continuous
+  Hodge Laplacian is ∇²u = −2u/R² (u is a divergence-free degree-1
+  harmonic). The discrete Rayleigh quotient ⟨u, ∇²u⟩/⟨u, u⟩
+  converges to −2 (unit sphere) at second order (−1.9974 / −1.9994 /
+  −1.9998 at n_subdivisions = 3/4/5), but the POINTWISE ratio
+  (∇²u)_e/u_e is not consistent: it scatters in ≈ [−2.8, −0.65] and
+  does not converge with refinement (the known O(1) truncation error
+  of the TRiSK vector Laplacian on Voronoi meshes). Use it as a
+  dissipation operator, not as an accurate ∇²u.
+"""
+function laplacian!(out::EdgeField, u::EdgeField)
+    mesh = u.mesh
+    div = divergence(u)                     # cell field [1/rad]
+    ζ = curl(u)                             # vertex vorticity [1/rad]
+    for e in 1:mesh.n_edges
+        v1 = mesh.edge_vertex_pos[e]        # t̂_e points toward v1
+        v2 = mesh.edge_vertex_neg[e]        # the far end
+        # [∇(∇·u)]_e = (div_j − div_i)/d_e  (primal→dual, dual distance
+        # d_e [rad], [u/rad])
+        # [k̂×∇ζ]_e·t̂ = −(ζ(v1) − ζ(v2))/l_e — over the PRIMAL edge
+        # length l_e [rad] (the two END VERTICES of e are l_e apart, not
+        # d_e apart; R10 symmetric operator skeleton). Sign checked by
+        # negative semi-definiteness and the rigid-rotation Rayleigh
+        # quotient (−2 on the unit sphere) in the #40 tests.
+        i, j = mesh.edge_cells[1, e], mesh.edge_cells[2, e]
+        out.data[e] = (div.data[j] - div.data[i]) / mesh.d_e[e] -
+                      (ζ.data[v1] - ζ.data[v2]) / mesh.l_e[e]
+    end
+    return out
+end
+
+"""
+    laplacian(u::EdgeField) -> EdgeField
+
+Allocating version of [`laplacian!`](@ref).
+"""
+laplacian(u::EdgeField) = laplacian!(similar_field(u), u)
 
 end # module TRiSK

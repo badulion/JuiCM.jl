@@ -88,15 +88,32 @@
 #     holds exactly, and the total volume follows the fast solver's
 #     flux-form continuity (conserved to round-off; Phase-1 SW mass
 #     conservation).
-#   tracers (T, S): advected inside the slow SSPRK by the flux-form
-#     upwind scheme (#32, OceanTracers) with the SAME layer fluxes the
-#     continuity uses — tracer and volume budgets are compatible by
-#     construction. The re-stretch remap keeps layer concentrations
-#     unchanged (the fast barotropic mode carries no tracer in the
-#     anomaly-form split — same approximation as the velocity split;
-#     the closure keeps a horizontally-uniform T(z) exact and its
-#     conservation error is second order in the anomalies; see
-#     OceanTracers module header).
+#   tracers (T, S): two schemes, selected by `ocean_step!`'s
+#     `tracer_advection` keyword.
+#     :fct (default; issue #40 decision) — operator split: T/S are
+#       frozen inside the slow SSPRK and advanced ONCE per mode-split
+#       step by the FCT scheme (#36, `fct_advect_tracer!`) from the
+#       start-of-step h to the re-stretched h. VOLUME COMPATIBILITY: the
+#       tracer is transported by the time-integrated layer mass fluxes
+#       that actually moved the thickness — the SSPRK-weighted
+#       (1/6, 1/6, 2/3) stage fluxes ĥ_k u′_k of the slow step, with
+#       their column sum replaced by the barotropic transport F̄_bt of
+#       the fast substeps (the flux whose divergence is the η̄ change,
+#       i.e. what the re-stretch imposes on the column), distributed
+#       over layers by the start-of-step edge thickness. Then
+#       Σ_k h_horiz,k = Σ_k h_new,k per column, the diagnosed surface
+#       interface velocity w_1 vanishes to round-off (no tracer flux
+#       through the sea surface), a constant tracer stays constant, and
+#       Σ A h C is conserved to round-off. The re-stretch redistribution
+#       between layers is the residual-diagnosed vertical transport.
+#       (Requires a column-consistent input state, Σ_k h_k − H0 = η,
+#       which every `ocean_step!` output satisfies.)
+#     :upwind — the #32 reference path: flux-form upwind tendency
+#       inside the slow SSPRK with the SAME layer fluxes the continuity
+#       uses; the re-stretch keeps layer concentrations unchanged (the
+#       fast barotropic mode carries no tracer in this path — the
+#       content error is second order in the anomalies; see the
+#       OceanTracers module header).
 #
 # This is a Lie splitting: O(Δt_slow) splitting error per step. The
 # depth-mean Coriolis of ū is advanced by the fast solver only (the
@@ -129,6 +146,7 @@ using ..Fields: Field, CellField, EdgeField, VertexField, CellLoc, EdgeLoc,
                 location, mesh_of, similar_field, lincomb!, axpy!,
                 similar_state, scale!, copyto!, fill!, valid_indices
 using ..TRiSK: divergence, divergence!, gradient, gradient!, curl,
+               laplacian,
                tangential_flux, edge_mean, kinetic_energy, pv_flux,
                potential_vorticity, integral
 using ..Layered: LayeredField, LayeredCellField, LayeredEdgeField, nlayers
@@ -136,8 +154,9 @@ using ..Vertical: VerticalGrid
 using ..OceanVertical: ssh_from_thickness, layer_center_z
 using ..OceanEOS: AbstractOceanEOS, ocean_density, ocean_density!
 using ..OceanTracers: tracer_tendency!
+using ..TracerFCT: fct_advect_tracer!
 using ..ShallowWater: williamson_constants
-using ..Atmos: SWState, sw_step!
+using ..Atmos: SWState, sw_step!, sw_tendency!
 using ..TimeStepping: ssprk3_step!, ssprk3_integrate!
 import ..TimeStepping: _stage, _lincomb!, _axpy!
 
@@ -162,8 +181,9 @@ abstraction 3, layered case):
   [`ocean_step!`](@ref) using the fast mode's η, so the
   state-consistent surface Σ_k h_k − H0 agrees with `eta` exactly.
 - `T` — per-layer temperature [K or °C] (`LayeredCellField`); advected
-  by the flux-form upwind scheme (#32, [`tracer_tendency!`](@ref))
-  inside the slow step, with the same layer fluxes the continuity uses
+  by the FCT scheme (#36/#40, operator split, default) or the #32
+  upwind scheme inside the slow step — either way with the mass fluxes
+  that moved h (see `ocean_step!`'s `tracer_advection`)
 - `S` — per-layer salinity [psu] (`LayeredCellField`); advected exactly
   like `T` (no sources/sinks yet — those are Phase-4 physics)
 - `eta` — free-surface height [m] (`CellField`), the *fast barotropic*
@@ -258,7 +278,8 @@ ocean_ssh(grid::VerticalGrid, s::OceanState) = s.eta
 
 """
     ocean_tendency!(out::OceanState, state::OceanState; grid, eos,
-                    eta = nothing, Omega = nothing) -> OceanState
+                    eta = nothing, Omega = nothing, nu_h = 0.0,
+                    c_drag = 0.0, advect_tracers = true) -> OceanState
 
 Baroclinic (slow) tendency of the layered system — see the module
 header for the equation set and scaled-variable assembly. `state.u`
@@ -272,18 +293,46 @@ heights; `nothing` = the state-consistent diagnostic (Σ h_k − H0,
 identical at every stage of a split step by the column invariant).
 
 After this call `out` holds the physical-unit tendencies of
-(u, h, T, S); T and S are advected by the flux-form upwind scheme
-(#32) with the same layer fluxes the continuity uses (compatibility by
-construction — see `OceanTracers`), and
-`eta`/`ubar` have zero tendency (they are advanced by the fast solver
-at the driver level, not inside the slow SSPRK).
+(u, h, T, S). With `advect_tracers = true` (default; the #32
+behavior) T and S carry the flux-form upwind tendency
+([`tracer_tendency!`](@ref)) with the same layer fluxes the continuity
+uses; with `advect_tracers = false` they carry ZERO tendency (the
+operator-split FCT path of [`ocean_step!`](@ref), which advances T/S
+outside the SSPRK). `eta`/`ubar` have zero tendency (they are advanced
+by the fast solver at the driver level, not inside the slow SSPRK).
+
+Optional dissipation (issue #40; both 0 = off, the #30 dynamics):
+
+- `nu_h` [m²/s] — CAP of the shock-sensor Laplacian viscosity
+  `+ν_e ∇²u′` on every layer, with the per-edge sensor
+  ν_e = min(ν_h, dx_e³ |∇²u′_e|), dx_e = R·d_e the physical cell-center
+  distance (no tunable prefactor: the "C" of the residual-based
+  artificial-dissipation class is fixed to 1). On smooth flow of scale
+  ℓ the damping ratio is ~ (dx/ℓ)³; at an unresolved jump
+  ν_e ~ |u| dx.
+- `c_drag` [–] — quadratic-drag coefficient C_d of the collapsed-layer
+  friction `−C_d u|u|/h_e`, applied only on edges whose thin flank
+  h_e = min(h_i, h_j) is below 5% of `grid.H0`; h_e is clamped below
+  at `1e-3·grid.H0` so a zero/negative stage thickness (possible inside
+  the SSPRK, the thickness floor acts once per step) gives a finite,
+  always-decelerating drag.
+
+Both act on the anomaly velocity u′ AFTER the baroclinic projection:
+their depth-mean part is not projected out, so it stays in u′ (the
+driver adds ū_end to u′ without removing u′'s own column mean) — it
+decelerates the layers but never reaches the fast mode (ū, η), and the
+column transport it induces is overwritten by the re-stretch. For the
+collapsed-sheet drag (sheets ≤ 5% of the column) this is a small
+effect; a bottom-drag on ū would belong to the fast solver (not
+implemented).
 
 Requires all of `state`'s ghost slots to be current in a partitioned
 run (single-region in #30; the partitioned driver lands with #45).
 """
 function ocean_tendency!(out::OceanState, state::OceanState;
                          grid::VerticalGrid, eos::AbstractOceanEOS,
-                         eta = nothing, Omega = nothing)
+                         eta = nothing, Omega = nothing, nu_h::Real = 0.0,
+                         c_drag::Real = 0.0, advect_tracers::Bool = true)
     mesh = mesh_of(state.h)
     (; R, g) = williamson_constants()
     Ω = Omega === nothing ? williamson_constants().Omega : Omega
@@ -391,8 +440,8 @@ function ocean_tendency!(out::OceanState, state::OceanState;
     for k in 1:K
         axpy!(fmean, 1.0, edge_mean(state.h[k]) * out.u[k])   # [m³/s⁴]·R
     end
-    for i in eachindex(fmean.data)
-        fmean.data[i] = fmean.data[i] / dent.data[i]
+    for i in eachindex(fmean)
+        fmean[i] = fmean[i] / dent[i]
     end                                            # depth-mean [m/s²]
     for k in 1:K
         axpy!(out.u[k], -1.0, fmean)
@@ -401,13 +450,111 @@ function ocean_tendency!(out::OceanState, state::OceanState;
         axpy!(out.u[k], 1.0, cors[k])
     end
 
-    # T and S: advected by the flux-form upwind scheme (issue #32) with
-    # the SAME layer fluxes the continuity just used (compatibility by
-    # construction — Tracers.jl module header); the continuity tendency
-    # out.h is passed in so the product-rule closure matches exactly.
+    # --- horizontal velocity dissipation (issue #40 decision): the
+    # shock-localized dissipation path for the UNRESOLVED hydraulic
+    # jump. The energy-conserving momentum discretization has no
+    # dissipation path, and the measured #40 lock-exchange runaway
+    # (|u| → ∞ at the stuck front cell; uniform-density bisection: NOT
+    # density-driven) is exactly the jump-JKE imbalance. Form: a
+    # per-edge Laplacian viscosity +∇·(ν_e ∇u) with the LAPLACIAN-
+    # MAGNITUDE shock sensor ν_e = min(ν_h, dx_e³ |∇²u|) (residual-
+    # based artificial dissipation class, Jameson). Why this sensor:
+    # (a) a |u|-based cap CANNOT localize — |u| is the same at the
+    # jump as along the smooth current, so the cap damps everything
+    # (measured: pure |u|d_e cap → F = 0.23, the uniform-ν failure);
+    # (b) a uniform ν_h can never balance the trail-step PGF (balance
+    # needs u ≈ √(PGF·dx) = √(g′H) — measured runaway at the
+    # floor-pinned trail step, layers pinned at h_min with a persistent
+    # density step); the Laplacian sensor gives exactly that balance
+    # while staying OFF on smooth flow (damping ratio ~ (dx/ℓ)³; the
+    # class's prefactor C is fixed to 1 — no tunable coefficient).
+    # ν_h is only a SAFETY CAP (effective ν set by the flow; the cap
+    # binds only in extreme states). Wave-speed/stability cap
+    # unnecessary: ν_e Δt / d_e² = |u| Δt / d_e ≪ 1 always (CFL).
+    # Per-edge dissipation (q_e = ν_e (u_j − u_i)/d_e): one TRiSK
+    # Laplacian per layer (each edge appears in exactly one cell pair
+    # so the per-edge ν_e re-weights the flux divergence directly), on
+    # the ANOMALY momentum (the fast mode carries the barotropic DOF
+    # separately).
+    if nu_h != 0.0
+        mesh = mesh_of(us[1])
+        for k in 1:K
+            lapu = laplacian(us[k])            # [u-units/rad²]
+            for e in 1:mesh.n_edges
+                # Laplacian-magnitude shock sensor (residual-based
+                # artificial dissipation): ν_e = min(ν_h, d_e³ R² |L_e|).
+                # Units: L_e [1/(rad·s)] = R·∇²u_phys, so
+                # d_e³ R² L_e = (d_e R)³ ∇²u = dx³ ∇²u [m²/s]. At a
+                # jump ∇²u ~ |u|/dx² → ν_e = |u|dx (the Re ≈ 1 capture
+                # value); on a smooth scale ℓ ≫ dx, ν_e ~ dx³ |u|/ℓ²
+                # → damping ratio (ν_e/|u|ℓ) ~ (dx/ℓ)³ — cubic in the
+                # resolution ratio, so smooth flow is untouched.
+                νe = mesh.d_e[e]^3 * R^2 * abs(lapu[e])
+                νe = νe < nu_h ? νe : nu_h
+                lapu[e] *= νe                  # ν_e-weighted [u·m/rad²·1/rad]
+            end
+            axpy!(out.u[k], 1.0 / R, lapu)     # [m/s²] (∇²_phys u = L_rad(u)/R²)
+        end
+    end
+
+    # --- quadratic drag on COLLAPSED layers (issue #40): C_d·|u|u/h_k
+    # — boundary-layer friction where a layer has collapsed to the
+    # thickness floor. The measured #40 trail runaway: a pinned sheet
+    # (h = h_min, ANY layer — measured in layer 1, the return flow, not
+    # just the bottom) under a persistent interface step accelerates
+    # without bound (u → 300 m/s): the sheet is smooth (the shock
+    # sensor cannot see it) while the step's PGF pumps it forever, and
+    # the FCT limiter refuses the flux that would erode the pinned
+    # step (monotonicity keeps the step). Drag balances that PGF at
+    # u* = √(PGF·h_min/C_d) (≈ 12 m/s at the #40 scaling) and is
+    # strictly zero for full-depth layers. Real physics, not a patch:
+    # a floor-collapsed sheet IS boundary flow; the laboratory currents
+    # have exactly this friction, and every production ocean model
+    # carries quadratic drag (C_d ≈ 2.5e-3, the canonical coefficient).
+    if c_drag != 0.0
+        # stage-thickness guard: inside the SSPRK an h_k can be ≤ 0 (the
+        # thickness floor acts once per step, after the tracer step);
+        # h_e ≤ 0 would give Inf/NaN (h_e = 0) or ANTI-drag (h_e < 0).
+        # Clamp to a positive drag thickness (1e-3·H0, a fiftieth of
+        # the 5%-H0 activation threshold) — finite and decelerating.
+        h_drag_min = 1.0e-3 * grid.H0 / R
+        h_drag_on = 0.05 * grid.H0 / R
+        for k in 1:K
+            hK = hs[k]                     # scaled thickness [rad]
+            ue = us[k]                     # scaled velocity [rad/s]
+            for e in 1:mesh.n_edges
+                i, j = mesh.edge_cells[1, e], mesh.edge_cells[2, e]
+                # MIN of the flanking thicknesses, not the mean: at a
+                # pinned-sheet edge (h = h_min beside a deep layer) the
+                # mean dilutes the drag ~20× and the sheet accelerates
+                # without bound (measured: the #40 day-7 runaway, u →
+                # 400 m/s). Boundary friction acts on the SHEET — the
+                # thin cell sets the drag scale.
+                h_e = max(min(hK[i], hK[j]), h_drag_min)
+                h_e < h_drag_on || continue
+                out.u[k][e] -= c_drag * ue[e] * abs(ue[e]) *
+                               R / h_e            # u|u|/h_phys [m/s²]
+            end
+        end
+    end
+
+    # T and S. advect_tracers = true: the #32 flux-form upwind
+    # tendency with the SAME layer fluxes the continuity used
+    # (compatibility by construction — Tracers.jl module header; the
+    # continuity tendency out.h is passed so the product-rule closure
+    # matches exactly). advect_tracers = false: zero tendency — the
+    # operator-split FCT path of ocean_step! (issue #40 decision; the
+    # Zalesak limiter is defined for complete content steps, not
+    # partial SSPRK-stage increments) advances T/S once per step with
+    # the stage-integrated mass fluxes (module header, "tracers").
+    if advect_tracers
+        tracer_tendency!(out.T, state.T, state.h, state.u; dhdt = out.h)
+        tracer_tendency!(out.S, state.S, state.h, state.u; dhdt = out.h)
+    else
+        fill!(out.T, 0.0)
+        fill!(out.S, 0.0)
+    end
     # eta/ubar: zero slow tendency (advanced by the fast solver)
-    tracer_tendency!(out.T, state.T, state.h, state.u; dhdt = out.h)
-    tracer_tendency!(out.S, state.S, state.h, state.u; dhdt = out.h)
     fill!(out.eta, 0.0)
     fill!(out.ubar, 0.0)
     return out
@@ -417,35 +564,79 @@ end
 
 """
     ocean_step!(state::OceanState, grid, eos, t, Δt;
-                n_sub = nothing, cfl = 0.3) -> OceanState
+                n_sub = nothing, cfl = 0.3, Omega = nothing,
+                nu_h = 0.0, c_drag = 0.0, min_h_frac = 0.0,
+                tracer_advection = :fct, floor_stats = nothing)
+        -> OceanState
 
 Advance one mode-split step of Δt [s] (single-region state):
 
 1. **fast**: the 2D SW system (H0 + η, ū) — from the carried
-   `state.eta`/`state.ubar` — substepped `n_sub` times (SSPRK(3,3) via
-   the Phase-1 `sw_step!`; `n_sub = nothing` picks the smallest count
-   with Δt/n_sub within the barotropic CFL limit `cfl·dx/√(g·H0)`,
-   minimum 1),
+   `state.eta`/`state.ubar` — substepped `n_sub` times (SSPRK(3,3) on
+   the Phase-1 `sw_tendency!`, identical to `sw_step!`; `n_sub =
+   nothing` picks the smallest count with Δt/n_sub within the
+   barotropic CFL limit `cfl·dx/√(g·H0)`, minimum 1),
 2. **slow**: SSPRK(3,3) baroclinic step on the velocity anomalies
-   u′ = u − ū ([`ocean_tendency!`](@ref), pure anomaly continuity
-   fluxes — the column sum is invariant) over Δt,
-3. **coupling**: replace the layers' depth-mean with the fast
-   solver's ū_end (`u_k = u′_k + ū_end`), re-stretch the column to the
-   coordinate map with the time-mean fast η, and store (η̄, ū_end)
-   back into the state (see module header). Layer tracers `T`/`S` ride
-   the slow SSPRK (upwind advection, #32); the re-stretch keeps their
-   concentrations unchanged (module header, "tracers").
+   u′ = u − ū ([`ocean_tendency!`](@ref), anomaly continuity fluxes)
+   over Δt,
+3. **coupling**: add the fast solver's ū_end to the layers
+   (`u_k = u′_k + ū_end`), re-stretch the column to the coordinate map
+   with the time-mean fast η, and store (η̄, ū_end) back into the state
+   (see module header),
+4. **tracers** (`tracer_advection`): `:fct` (default, issue #40) —
+   operator-split FCT step ([`fct_advect_tracer!`](@ref)) driven by the
+   time-integrated layer mass fluxes that actually moved h (slow
+   SSPRK stages + fast substeps; module header "tracers") — volume
+   compatible: constant tracers stay constant and Σ A h C is conserved
+   to round-off; `:upwind` — the #32 upwind tendency inside the slow
+   SSPRK,
+5. **floor** (only if `min_h_frac > 0`): see
+   [`_apply_thickness_floor!`](@ref).
 
-Split scheme documented in the module header (Lie splitting,
+Keywords:
+
+- `nu_h` [m²/s] — cap of the shock-sensor viscosity
+  ν_e = min(ν_h, dx_e³|∇²u′_e|) (see [`ocean_tendency!`](@ref); 0 = off).
+- `c_drag` [–] — collapsed-layer quadratic drag coefficient
+  (see [`ocean_tendency!`](@ref); 0 = off).
+- `min_h_frac` [–] — minimum layer thickness as a fraction of
+  `grid.H0` (h_min = min_h_frac·H0), applied once per step after the
+  tracer step. **Opt-in** (default 0 = no floor). Must satisfy
+  `min_h_frac·K < 1` (otherwise a resting column is entirely below the
+  floor) — an `ArgumentError` is thrown.
+- `floor_stats` — `nothing` or a `Dict{Symbol, Float64}` that
+  accumulates the floor's non-standard interventions (see
+  [`_apply_thickness_floor!`](@ref)).
+
+Requires a column-consistent input state (Σ_k h_k − H0 = η, which
+every `ocean_step!` output satisfies) for the `:fct` budget to be
+exact. Split scheme documented in the module header (Lie splitting,
 MPAS-O-flavored barotropic/baroclinic split).
 """
 function ocean_step!(state::OceanState, grid::VerticalGrid,
                      eos::AbstractOceanEOS, t::Real, Δt::Real;
-                     n_sub = nothing, cfl::Real = 0.3, Omega = nothing)
+                     n_sub = nothing, cfl::Real = 0.3, Omega = nothing,
+                     nu_h::Real = 0.0, min_h_frac::Real = 0.0,
+                     c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
+                     floor_stats = nothing)
     mesh = mesh_of(state.h)
     (; R, g) = williamson_constants()
     H0 = grid.H0
     K = nlayers(state.h)
+    tracer_advection in (:fct, :upwind) ||
+        throw(ArgumentError("ocean_step!: tracer_advection must be " *
+                            ":fct or :upwind, got $tracer_advection"))
+    0 <= min_h_frac * K < 1 ||
+        throw(ArgumentError("ocean_step!: min_h_frac = $min_h_frac with " *
+                            "$K layers puts the resting column below the " *
+                            "floor (need 0 ≤ min_h_frac·K < 1)"))
+    use_fct = tracer_advection === :fct
+
+    # SSPRK(3,3) Butcher weights b = (1/6, 1/6, 2/3) of the three L
+    # evaluations (TimeStepping._ssprk3_core! calls L in stage order):
+    # the step's h increment is exactly −(Δt/R)∇·(Σ_s b_s F_s), so the
+    # b-weighted stage fluxes are the time-integrated mass flux.
+    ssprk_b = (1 / 6, 1 / 6, 2 / 3)
 
     # --- fast mode: 2D SW system (H0 + η, ū) from the carried state ---
     eta0 = state.eta
@@ -470,10 +661,28 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     # physically meaningful volume change); the oscillation averages
     # out. Includes both endpoints: η̄ = (η_0/2 + Σ_{n=1..n_sub−1} η_n +
     # η_end/2)/n_sub.
+    #
+    # Barotropic transport consistent with η̄ (tracer budget, :fct):
+    # η_n − η_0 = −(Δtf/R) ∇·Σ_{m≤n} F_m with F_m the b-weighted SSPRK
+    # flux ĥū of substep m, so
+    #   η̄ − η_0 = −(Δt/R) ∇·F̄_bt,  F̄_bt = Σ_m (n_sub − m + ½)/n_sub² F_m
+    # — exactly the column volume change the re-stretch imposes.
+    Fbt = fill!(similar_field(ubar0), 0.0)        # [m²/s]
+    wsub = Ref(0.0)
+    fstage = Ref(0)
+    function Lfast(out, s, τ)
+        sw_tendency!(out, s)               # == sw_step!'s L (no physics)
+        if use_fct
+            fstage[] = fstage[] % 3 + 1
+            axpy!(Fbt, wsub[] * ssprk_b[fstage[]], edge_mean(s.h) * s.u)
+        end
+        return out
+    end
     eta_mean = lincomb!(similar_field(eta0), 1.0,
                         fill!(similar_field(eta0), H0 / 2), 0.5, eta0)
     for n in 1:n_sub
-        fast = sw_step!(fast, t + (n - 1) * Δtf, Δtf)
+        wsub[] = (n_sub - n + 0.5) / n_sub^2
+        fast = ssprk3_step!(Lfast, fast, t + (n - 1) * Δtf, Δtf)
         if n < n_sub
             axpy!(eta_mean, 1.0, fast.h)   # accumulate H0 + η_n
         end
@@ -485,20 +694,30 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     ubar1 = fast.u                         # end-of-step fast ū
 
     # --- slow mode: baroclinic SSPRK(3,3) on the anomalies u′ = u − ū ---
-    # pure anomaly fluxes in the slow continuity (exact column
-    # invariant); ū_start removed before the step, ū_end attached after
+    # ū_start removed before the step, ū_end attached after
     work = copy(state)
     for k in 1:K
         axpy!(work.u[k], -1.0, ubar0)      # project: u′ = u − ū_start
     end
-    L(out, s, τ) = ocean_tendency!(out, s; grid = grid, eos = eos,
-                                   eta = eta0, Omega = Omega)
+    # time-integrated slow layer fluxes Σ_s b_s ĥ_k,s u′_k,s [m²/s]
+    Fsl = [fill!(similar_field(state.u[k]), 0.0) for k in 1:K]
+    sstage = Ref(0)
+    function L(out, s, τ)
+        ocean_tendency!(out, s; grid = grid, eos = eos, eta = eta0,
+                        Omega = Omega, nu_h = nu_h, c_drag = c_drag,
+                        advect_tracers = !use_fct)
+        if use_fct
+            sstage[] = sstage[] % 3 + 1
+            for k in 1:K
+                axpy!(Fsl[k], ssprk_b[sstage[]], edge_mean(s.h[k]) * s.u[k])
+            end
+        end
+        return out
+    end
     # ssprk3_step! returns a NEW state (the TimeStepping contract)
     work = ssprk3_step!(L, work, t, Δt)
 
-    # --- coupling: REPLACE the layers' depth-mean with the fast
-    # solver's ū_end (the slow system's barotropic velocity DOF is
-    # unphysical — its force was frozen — so it is discarded)
+    # --- coupling: attach the fast solver's ū_end to the layers
     for k in 1:K
         axpy!(work.u[k], 1.0, ubar1)       # u = u′ + ū_end
     end
@@ -526,29 +745,209 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     else
         ratio = lincomb!(similar_field(eta1), 1.0,
                          fill!(similar_field(eta1), H0), 1.0, eta1)
-        for i in eachindex(ratio.data)
-            ratio.data[i] = ratio.data[i] / colsum.data[i]
+        for i in eachindex(ratio)
+            ratio[i] = ratio[i] / colsum[i]
         end
         for k in 1:K
             copyto!(work.h[k], work.h[k] * ratio)   # payload-preserving
         end
     end
+
+    # --- tracer advance (:fct; operator split, issue #40 decision):
+    # T/S with the production FCT scheme over the FULL step, from the
+    # pre-step thicknesses (state.h) to the re-stretched pre-floor
+    # thicknesses, transported by the mass fluxes that ACTUALLY moved h
+    # (volume compatibility; module header "tracers"):
+    #   F_k = F_sl,k + (ĥ_k/Σ_j ĥ_j)·(F̄_bt − Σ_j F_sl,j),  ĥ = edge_mean(h_old)
+    # Σ_k F_k = F̄_bt, so Σ_k h_horiz,k = Σ_k h_old,k − (Δt/R)∇·F̄_bt
+    # = H0 + η̄ = Σ_k h_new,k: the surface interface velocity diagnosed
+    # by the FCT vanishes and no tracer crosses the sea surface. The
+    # slow column transport Σ F_sl (nonzero whenever u′ has a column
+    # mean) is replaced by F̄_bt exactly as the re-stretch replaces the
+    # slow column volume by H0 + η̄. `fct_advect_tracer!` takes a
+    # VELOCITY and forms F = ĥ_old·u itself, so the flux is passed as
+    # u_tr = F/ĥ_old (exact up to one rounding). Edges with ĥ_old,k = 0
+    # (layer empty on both flanks at step start) cannot carry flux in
+    # this interface (u_tr = 0); their mismatch would reach w_1 — only
+    # possible without the floor.
+    if use_fct
+        hm = [edge_mean(state.h[k]) for k in 1:K]
+        u_tr = similar(work.u)
+        for e in eachindex(Fbt)
+            htot = 0.0
+            Fcol = 0.0
+            for k in 1:K
+                htot += hm[k][e]
+                Fcol += Fsl[k][e]
+            end
+            corr = htot != 0 ? (Fbt[e] - Fcol) / htot : 0.0
+            for k in 1:K
+                u_tr[k][e] = hm[k][e] != 0 ? Fsl[k][e] / hm[k][e] + corr : 0.0
+            end
+        end
+        fct_advect_tracer!(work.T, state.h, work.h, u_tr, Δt)
+        fct_advect_tracer!(work.S, state.h, work.h, u_tr, Δt)
+    end
+
+    # --- minimum-thickness floor (opt-in) ---
+    if min_h_frac > 0
+        _apply_thickness_floor!(work.h, (work.T, work.S), work.eta,
+                                min_h_frac * H0, H0; stats = floor_stats)
+    end
     return work
 end
 
 """
-    ocean_integrate!(state, grid, eos, t0, t_final, n_steps;
-                     n_sub = nothing) -> OceanState
+    _apply_thickness_floor!(h, tracers, eta, h_min, H0; stats = nothing)
 
-Integrate `n_steps` equal mode-split steps (see [`ocean_step!`](@ref)).
+Minimum-thickness floor of [`ocean_step!`](@ref) (issue #40,
+user-ratified; the MPAS-O min-thickness treatment class, Petersen et
+al. 2018 §2.6), per column i:
+
+1. **Ordinary column** (headroom Σ_k max(h_k − h_min, 0) > deficit
+   Σ_k max(h_min − h_k, 0)): layers below h_min are raised to h_min and
+   the deficit is charged to the layers with headroom by scaling their
+   excess above h_min with f = 1 − deficit/headroom. Column volume
+   Σ_k h_k and tracer content Σ_k h_k C_k are conserved to round-off:
+   headroom layers keep their concentration, a clipped layer receives
+   the excess-weighted mixture of the donor layers.
+2. **Starved column with positive volume** (0 < Σ_k h_k ≤ K·h_min,
+   headroom ≤ deficit): the floor cannot be met conservatively. The
+   column is HOMOGENIZED: every layer gets h_k = Σ_j h_j/K (> 0, but
+   below h_min) and every tracer its column-mean concentration
+   Σ h C/Σ h — volume and content conserved, the column's vertical
+   structure is lost. Counted in `stats[:homogenized_columns]`.
+3. **Non-positive column volume** (Σ_k h_k ≤ 0): no conservative fix
+   exists. Every layer is set to h_min (tracer concentrations kept;
+   layers with h ≤ 0 take the column's thickness-positive-weighted mean,
+   or keep their own value if none), η is raised accordingly so the
+   column stays consistent (Σ h − H0 = η), and the added volume
+   K·h_min − Σ_k h_k [m] is NOT conserved: counted in
+   `stats[:added_volume_columns]` and summed (per-column metres, not
+   area-weighted) in `stats[:added_volume_m]`.
+
+`h` is a `LayeredCellField`, `tracers` a tuple of `LayeredCellField`s
+remapped with h, `eta` the surface `CellField`; `stats` is `nothing` or
+a `Dict{Symbol, Float64}` that is accumulated into.
+"""
+function _apply_thickness_floor!(h::LayeredCellField, tracers, eta::CellField,
+                                 h_min::Real, H0::Real; stats = nothing)
+    K = nlayers(h)
+    taken = zeros(Float64, K)
+    gained = zeros(Float64, K)
+    hpre = zeros(Float64, K)
+    cpre = zeros(Float64, K)
+    bump!(key, v) = stats === nothing ||
+                    (stats[key] = get(stats, key, 0.0) + v; nothing)
+    for i in eachindex(h[1])
+        deficit = 0.0
+        headroom = 0.0
+        col = 0.0
+        for k in 1:K
+            hk = h[k][i]
+            col += hk
+            hk < h_min ? (deficit += h_min - hk) : (headroom += hk - h_min)
+        end
+        deficit > 0 || continue
+        if headroom > deficit
+            # (1) ordinary column: conservative scaled-excess transfer
+            f = 1.0 - deficit / headroom
+            for k in 1:K
+                hk = h[k][i]
+                hpre[k] = hk
+                taken[k] = 0.0
+                gained[k] = 0.0
+                if hk < h_min
+                    h[k][i] = h_min
+                    gained[k] = h_min - hk
+                else
+                    h[k][i] = h_min + (hk - h_min) * f
+                    taken[k] = (hk - h_min) * (1.0 - f)
+                end
+            end
+            # tracer remap: headroom layers keep their concentration
+            # (their h and content scale together); clipped layers
+            # receive the excess-weighted donor mixture.
+            for C in tracers
+                for k in 1:K
+                    cpre[k] = C[k][i]
+                end
+                for k in 1:K
+                    gained[k] == 0.0 && continue
+                    m = hpre[k] * cpre[k]
+                    for j in 1:K
+                        taken[j] == 0.0 || (m += gained[k] * taken[j] /
+                                            deficit * cpre[j])
+                    end
+                    C[k][i] = m / h_min
+                end
+            end
+        elseif col > 0
+            # (2) starved, positive volume: homogenize (conservative)
+            hbar = col / K
+            for C in tracers
+                q = 0.0
+                for k in 1:K
+                    q += h[k][i] * C[k][i]
+                end
+                for k in 1:K
+                    C[k][i] = q / col
+                end
+            end
+            for k in 1:K
+                h[k][i] = hbar
+            end
+            bump!(:homogenized_columns, 1.0)
+        else
+            # (3) non-positive volume: refill to h_min (NOT conservative)
+            for C in tracers
+                w = 0.0
+                q = 0.0
+                for k in 1:K
+                    if h[k][i] > 0
+                        w += h[k][i]
+                        q += h[k][i] * C[k][i]
+                    end
+                end
+                for k in 1:K
+                    (h[k][i] <= 0 && w > 0) && (C[k][i] = q / w)
+                end
+            end
+            added = K * h_min - col
+            for k in 1:K
+                h[k][i] = h_min
+            end
+            eta[i] = K * h_min - H0
+            bump!(:added_volume_columns, 1.0)
+            bump!(:added_volume_m, added)
+        end
+    end
+    return h
+end
+
+"""
+    ocean_integrate!(state, grid, eos, t0, t_final, n_steps;
+                     n_sub = nothing, Omega = nothing, nu_h = 0.0,
+                     min_h_frac = 0.0, c_drag = 0.0,
+                     tracer_advection = :fct, floor_stats = nothing)
+        -> OceanState
+
+Integrate `n_steps` equal mode-split steps (see [`ocean_step!`](@ref)
+for the keywords).
 """
 function ocean_integrate!(state::OceanState, grid::VerticalGrid,
                           eos::AbstractOceanEOS, t0::Real, t_final::Real,
-                          n_steps::Integer; n_sub = nothing, Omega = nothing)
+                          n_steps::Integer; n_sub = nothing, Omega = nothing,
+                          nu_h::Real = 0.0, min_h_frac::Real = 0.0,
+                          c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
+                          floor_stats = nothing)
     Δt = (t_final - t0) / n_steps
     for n in 1:n_steps
         state = ocean_step!(state, grid, eos, t0 + (n - 1) * Δt, Δt;
-                            n_sub = n_sub, Omega = Omega)
+                            n_sub = n_sub, Omega = Omega, nu_h = nu_h,
+                            min_h_frac = min_h_frac, c_drag = c_drag,
+                            tracer_advection = tracer_advection,
+                            floor_stats = floor_stats)
     end
     return state
 end
