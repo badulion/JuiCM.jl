@@ -115,6 +115,27 @@
 #       content error is second order in the anomalies; see the
 #       OceanTracers module header).
 #
+#   z* regrid (issue #62, DESIGN.md D7; opt-in `regrid = true`): the
+#     proportional re-stretch above keeps the layer FRACTIONS of the
+#     Lagrangian layers, so layers can collapse (#40: floor-pinned
+#     sheets beside 30–110 km neighbours, whose Coriolis/Bernoulli
+#     forcing drives a runaway). With regrid the step ends with a
+#     vertical ALE remap to the z* target h_k = Δf_k·(H0 + η̄)
+#     (`layer_thickness(grid, η̄)`), as in MPAS-O (Petersen et al.
+#     2015) and MOM6 (Adcroft et al. 2019): u by a conservative,
+#     MC-limited piecewise-linear remap of every edge column
+#     (`_remap_edge_columns!`; Σ_k ĥ_k u_k exact, no new extrema), and
+#     T/S by the FCT step with h_new = target, whose residual-diagnosed
+#     vertical flux (`vertical_order = 2`, limited PLM) IS the remap.
+#     Default `false`: the layered internal-wave tests exercise the
+#     Lagrangian layers.
+#     Refs: Petersen, M.R. et al. (2015), "Evaluation of the arbitrary
+#     Lagrangian–Eulerian vertical coordinate method in the MPAS-Ocean
+#     model", Ocean Modelling 86, 93–113; Adcroft, A. et al. (2019),
+#     "The GFDL global ocean and sea ice model OM4.0", JAMES 11,
+#     3167–3211 (MOM6 ALE); White & Adcroft (2008, JCP 227) and van
+#     Leer (1977, JCP 23) for the limited remap.
+#
 # This is a Lie splitting: O(Δt_slow) splitting error per step. The
 # depth-mean Coriolis of ū is advanced by the fast solver only (the
 # slow system evolves anomalies), so no double-counting. The barotropic
@@ -151,10 +172,10 @@ using ..TRiSK: divergence, divergence!, gradient, gradient!, curl,
                potential_vorticity, integral
 using ..Layered: LayeredField, LayeredCellField, LayeredEdgeField, nlayers
 using ..Vertical: VerticalGrid
-using ..OceanVertical: ssh_from_thickness, layer_center_z
+using ..OceanVertical: ssh_from_thickness, layer_center_z, layer_thickness
 using ..OceanEOS: AbstractOceanEOS, ocean_density, ocean_density!
 using ..OceanTracers: tracer_tendency!
-using ..TracerFCT: fct_advect_tracer!
+using ..TracerFCT: fct_advect_tracer!, _mc
 using ..ShallowWater: williamson_constants
 using ..Atmos: SWState, sw_step!, sw_tendency!
 using ..TimeStepping: ssprk3_step!, ssprk3_integrate!
@@ -560,13 +581,85 @@ function ocean_tendency!(out::OceanState, state::OceanState;
     return out
 end
 
+# ------------------------------------------------------ z* regrid
+
+"""
+    _remap_edge_columns!(u::LayeredEdgeField, hsrc::LayeredCellField,
+                         hdst::LayeredCellField) -> u
+
+Conservative vertical ALE remap of the layer velocities on every edge
+column (issue #62, the momentum half of the z* regrid in
+[`ocean_step!`](@ref)) from the source edge thicknesses
+ĥ^s_k = (hsrc_k,i + hsrc_k,j)/2 (the post-step Lagrangian layers) to the
+target ones ĥ^d_k (edge means of `hdst`, the z* layers). The two
+columns must have the same total (it is enforced to round-off: the
+bottom target interface is set to the source one).
+
+Flux form, with interface depths z_k measured downward from the
+surface (z_1 = 0, z_{k+1} = z_k + ĥ_k): interior interface k moves by
+d_k = z^d_k − z^s_k, and the swept volume d_k carries the DONOR
+layer's MC-limited piecewise-linear face value with the van Leer
+Courant correction (donor m = k if d_k > 0, else k − 1):
+
+    s_m  = MC(u_m − u_{m−1}, u_{m+1} − u_m)
+    u_f  = u_m ∓ ½ s_m (1 − |d_k|/ĥ^s_m)         (− if d_k > 0)
+    ĥ^d_k u_k ← ĥ^s_k u_k + d_{k+1} u_f,{k+1} − d_k u_f,k
+
+(MC = monotonized-central limiter, `TracerFCT._mc`; van Leer 1977).
+Each interface transfer is one number seen by both layers, so the
+column momentum Σ_k ĥ_k u_k is conserved exactly (round-off). The
+face value lies between the donor's and the receiver's velocities, so
+for |d_k| ≤ ĥ^s_m (the per-step interface excursion of the z* regrid
+is a small fraction of a layer) the remap creates no new extrema. This
+is the piecewise-linear member of the limited remap family used by
+MOM6's ALE (White & Adcroft 2008) and MPAS-O's z* vertical transport.
+
+Per-edge scalar loop through `Field[i]` getindex (AGENTS.md rule 3).
+"""
+function _remap_edge_columns!(u::LayeredEdgeField, hsrc::LayeredCellField,
+                              hdst::LayeredCellField)
+    K = nlayers(u)
+    nlayers(hsrc) == nlayers(hdst) == K ||
+        throw(ArgumentError("_remap_edge_columns!: layer counts differ"))
+    mesh = mesh_of(u)
+    zs = zeros(K + 1); zd = zeros(K + 1); uc = zeros(K); q = zeros(K)
+    for e in 1:mesh.n_edges
+        i, j = mesh.edge_cells[1, e], mesh.edge_cells[2, e]
+        for k in 1:K
+            zs[k + 1] = zs[k] + 0.5 * (hsrc[k][i] + hsrc[k][j])
+            zd[k + 1] = zd[k] + 0.5 * (hdst[k][i] + hdst[k][j])
+            uc[k] = u[k][e]
+            q[k] = (zs[k + 1] - zs[k]) * uc[k]
+        end
+        zd[K + 1] = zs[K + 1]                 # identical totals (round-off)
+        for k in 2:K
+            d = zd[k] - zs[k]                 # > 0: source k → target k−1
+            d == 0 && continue
+            m = d > 0 ? k : k - 1             # donor layer
+            hm = zs[m + 1] - zs[m]
+            up = m > 1 ? uc[m] - uc[m - 1] : 0.0
+            dn = m < K ? uc[m + 1] - uc[m] : 0.0
+            c = hm > 0 ? min(1.0, abs(d) / hm) : 1.0
+            uf = uc[m] + (d > 0 ? -0.5 : 0.5) * _mc(up, dn) * (1 - c)
+            q[k - 1] += d * uf
+            q[k] -= d * uf
+        end
+        for k in 1:K
+            hk = zd[k + 1] - zd[k]
+            u[k][e] = hk > 0 ? q[k] / hk : uc[k]
+        end
+    end
+    return u
+end
+
 # -------------------------------------------------------------- drivers
 
 """
     ocean_step!(state::OceanState, grid, eos, t, Δt;
                 n_sub = nothing, cfl = 0.3, Omega = nothing,
                 nu_h = 0.0, c_drag = 0.0, min_h_frac = 0.0,
-                tracer_advection = :fct, floor_stats = nothing)
+                tracer_advection = :fct, floor_stats = nothing,
+                regrid = false)
         -> OceanState
 
 Advance one mode-split step of Δt [s] (single-region state):
@@ -590,7 +683,8 @@ Advance one mode-split step of Δt [s] (single-region state):
    compatible: constant tracers stay constant and Σ A h C is conserved
    to round-off; `:upwind` — the #32 upwind tendency inside the slow
    SSPRK,
-5. **floor** (only if `min_h_frac > 0`): see
+5. **z* regrid** (only if `regrid = true`): see below,
+6. **floor** (only if `min_h_frac > 0`): see
    [`_apply_thickness_floor!`](@ref).
 
 Keywords:
@@ -607,6 +701,18 @@ Keywords:
 - `floor_stats` — `nothing` or a `Dict{Symbol, Float64}` that
   accumulates the floor's non-standard interventions (see
   [`_apply_thickness_floor!`](@ref)).
+- `regrid` — z* vertical coordinate (issue #62, DESIGN.md D7). `true`:
+  after the re-stretch the layers are restored to the z* target
+  `layer_thickness(grid, η̄)` (h_k = Δf_k·(H0 + η̄)) every step — the
+  vertical ALE remap of MPAS-O/MOM6. u is remapped per edge column by
+  [`_remap_edge_columns!`](@ref) (Σ_k ĥ_k u_k exact, MC-limited, no new
+  extrema), T/S by the FCT step with h_new = target and the limited
+  second-order vertical flux (`vertical_order = 2`; content exact).
+  Layers then cannot collapse, so the floor and the collapsed-layer
+  drag stay inactive in practice. Requires `tracer_advection = :fct`
+  (`ArgumentError` otherwise). Default `false`: Lagrangian layers
+  re-stretched with fractions preserved (the #30 behaviour the layered
+  internal-wave tests exercise).
 
 Requires a column-consistent input state (Σ_k h_k − H0 = η, which
 every `ocean_step!` output satisfies) for the `:fct` budget to be
@@ -618,7 +724,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
                      n_sub = nothing, cfl::Real = 0.3, Omega = nothing,
                      nu_h::Real = 0.0, min_h_frac::Real = 0.0,
                      c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
-                     floor_stats = nothing)
+                     floor_stats = nothing, regrid::Bool = false)
     mesh = mesh_of(state.h)
     (; R, g) = williamson_constants()
     H0 = grid.H0
@@ -631,6 +737,10 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
                             "$K layers puts the resting column below the " *
                             "floor (need 0 ≤ min_h_frac·K < 1)"))
     use_fct = tracer_advection === :fct
+    (regrid && !use_fct) &&
+        throw(ArgumentError("ocean_step!: regrid = true requires " *
+                            "tracer_advection = :fct (the tracer remap is " *
+                            "the FCT vertical flux)"))
 
     # SSPRK(3,3) Butcher weights b = (1/6, 1/6, 2/3) of the three L
     # evaluations (TimeStepping._ssprk3_core! calls L in stage order):
@@ -785,8 +895,30 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
                 u_tr[k][e] = hm[k][e] != 0 ? Fsl[k][e] / hm[k][e] + corr : 0.0
             end
         end
-        fct_advect_tracer!(work.T, state.h, work.h, u_tr, Δt)
-        fct_advect_tracer!(work.S, state.h, work.h, u_tr, Δt)
+        if regrid
+            # --- z* ALE regrid (issue #62, DESIGN.md D7; module
+            # header): restore the layers to the z* target
+            # h_k = Δf_k·(H0 + η̄). Its column total equals the
+            # re-stretched Σ_k h_k (both H0 + η̄), so the regrid is a
+            # pure vertical redistribution: u by the conservative
+            # limited edge-column remap from the Lagrangian layers to
+            # the target; T/S by the same FCT step with h_new = target,
+            # whose continuity-residual vertical flux carries the
+            # Lagrangian → target transport (limited PLM, one flux per
+            # interface: content exact).
+            target = layer_thickness(grid, eta1)
+            _remap_edge_columns!(work.u, work.h, target)
+            fct_advect_tracer!(work.T, state.h, target, u_tr, Δt;
+                               vertical_order = 2)
+            fct_advect_tracer!(work.S, state.h, target, u_tr, Δt;
+                               vertical_order = 2)
+            for k in 1:K
+                copyto!(work.h[k], target[k])
+            end
+        else
+            fct_advect_tracer!(work.T, state.h, work.h, u_tr, Δt)
+            fct_advect_tracer!(work.S, state.h, work.h, u_tr, Δt)
+        end
     end
 
     # --- minimum-thickness floor (opt-in) ---
@@ -929,7 +1061,8 @@ end
     ocean_integrate!(state, grid, eos, t0, t_final, n_steps;
                      n_sub = nothing, Omega = nothing, nu_h = 0.0,
                      min_h_frac = 0.0, c_drag = 0.0,
-                     tracer_advection = :fct, floor_stats = nothing)
+                     tracer_advection = :fct, floor_stats = nothing,
+                     regrid = false)
         -> OceanState
 
 Integrate `n_steps` equal mode-split steps (see [`ocean_step!`](@ref)
@@ -940,14 +1073,14 @@ function ocean_integrate!(state::OceanState, grid::VerticalGrid,
                           n_steps::Integer; n_sub = nothing, Omega = nothing,
                           nu_h::Real = 0.0, min_h_frac::Real = 0.0,
                           c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
-                          floor_stats = nothing)
+                          floor_stats = nothing, regrid::Bool = false)
     Δt = (t_final - t0) / n_steps
     for n in 1:n_steps
         state = ocean_step!(state, grid, eos, t0 + (n - 1) * Δt, Δt;
                             n_sub = n_sub, Omega = Omega, nu_h = nu_h,
                             min_h_frac = min_h_frac, c_drag = c_drag,
                             tracer_advection = tracer_advection,
-                            floor_stats = floor_stats)
+                            floor_stats = floor_stats, regrid = regrid)
     end
     return state
 end

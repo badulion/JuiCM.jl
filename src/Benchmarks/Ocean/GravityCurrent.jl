@@ -359,7 +359,7 @@ end
                                nu_h = 1e5, c_drag = 2.5e-3,
                                min_h_frac = 0.01, Omega = nothing,
                                frac = 0.5, band = 0.1, nbins = 200,
-                               step_kwargs = (;))
+                               regrid = false, step_kwargs = (;))
         -> (; state, t, xf, buoyancy)
 
 Run the lock-exchange release from `state` (an at-rest
@@ -378,6 +378,12 @@ g′ = 4e-4 m/s² and an n_subdivisions = 4 mesh, set by the caller via
 rotation. `step_kwargs` is forwarded verbatim to `ocean_step!` (and
 overrides the named keywords) for dycore options not listed here.
 
+`regrid = true` selects the z* regridded vertical coordinate of
+[`ocean_step!`](@ref) (issue #62, DESIGN.md D7: layers restored to the
+z* target every step, so they cannot collapse; the floor and the
+collapsed-layer drag then stay inactive). Default `false` keeps the
+Lagrangian-layer configuration of record.
+
 `ocean_step!` returns a new state; the input `state` binding is not
 updated, so use the returned `state` (the final state). Also returns
 the save times `t` [s], front positions `xf` [rad] and buoyancy
@@ -390,13 +396,14 @@ function gravity_current_benchmark!(state::OceanState, grid::VerticalGrid,
                                     nu_h::Real = 1e5, c_drag::Real = 2.5e-3,
                                     min_h_frac::Real = 0.01, Omega = nothing,
                                     frac::Real = 0.5, band::Real = 0.1,
-                                    nbins::Integer = 200,
+                                    nbins::Integer = 200, regrid::Bool = false,
                                     step_kwargs::NamedTuple = (;))
     diag(st) = (front_position(st.T, st.h; T_amb = T_amb, ΔT = ΔT,
                                frac = frac, band = band, nbins = nbins),
                 buoyancy_content(st.T, st.h; T_amb = T_amb))
     kw = merge((; n_sub = n_sub, nu_h = nu_h, c_drag = c_drag,
-                  min_h_frac = min_h_frac, Omega = Omega), step_kwargs)
+                  min_h_frac = min_h_frac, Omega = Omega, regrid = regrid),
+               step_kwargs)
     t = Float64[0.0]
     x0, b0 = diag(state)
     xf = Float64[x0]; buoy = Float64[b0]
