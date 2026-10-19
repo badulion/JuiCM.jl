@@ -1,0 +1,4 @@
+# quantity,value,unit,source
+front_froude_full_depth_lo,0.48,-,Shin Dalziel & Linden 2004 (full-depth lock D/H=1; slumping phase)
+front_froude_full_depth_hi,0.50,-,Shin Dalziel & Linden 2004 / Benjamin 1968 energy-conserving front
+tolerance_relative,0.10,-,issue #40 acceptance (ratified 2026-10-16)

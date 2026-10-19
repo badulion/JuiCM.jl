@@ -238,8 +238,13 @@ Cell-centered kinetic energy per unit mass (R10 Eq 63):
 
 The weights A_e/4 sum to A_i over the edges of i (R10 Eq 64), making K
 a convex combination of the surrounding u² — no spurious extrema.
+
+`closed_edges` (keyword, default `nothing`): solid-wall edges. In a
+wall cell their zero normal velocity is a boundary condition, not a
+sample of the cell's flow, so the cell averages over its OPEN edges:
+K_i = (1/A_i)·Σ_open (A_e/4) u_e² · (Σ_all A_e/4)/(Σ_open A_e/4).
 """
-function kinetic_energy!(out::CellField, u::EdgeField)
+function kinetic_energy!(out::CellField, u::EdgeField; closed_edges = nothing)
     mesh = u.mesh
     fill!(out, 0)
     for e in 1:mesh.n_edges
@@ -248,16 +253,42 @@ function kinetic_energy!(out::CellField, u::EdgeField)
         out.data[i] += w
         out.data[j] += w
     end
-    out.data ./= mesh.cell_area
+    if closed_edges === nothing
+        out.data ./= mesh.cell_area
+    else
+        # wall cells: average u² over the OPEN edges only (the closed
+        # edges' zero normal velocity is a boundary condition, not a
+        # sample of the cell's velocity): rescale the cell's sum by
+        # Σ_all A_e/4 ÷ Σ_open A_e/4, so a wall cell weighs its open
+        # edges exactly as an interior cell weighs all of its edges
+        wall = zeros(mesh.n_cells)                 # Σ_closed A_e/4
+        wtot = zeros(mesh.n_cells)                 # Σ_all A_e/4
+        for e in 1:mesh.n_edges
+            a = mesh.l_e[e] * mesh.d_e[e] / 4
+            wtot[mesh.edge_cells[1, e]] += a
+            wtot[mesh.edge_cells[2, e]] += a
+        end
+        for e in closed_edges
+            a = mesh.l_e[e] * mesh.d_e[e] / 4
+            wall[mesh.edge_cells[1, e]] += a
+            wall[mesh.edge_cells[2, e]] += a
+        end
+        for i in eachindex(wall)
+            open_w = wtot[i] - wall[i]
+            out.data[i] = open_w > 0 ?
+                out.data[i] / mesh.cell_area[i] * (wtot[i] / open_w) : 0.0
+        end
+    end
     return out
 end
 
 """
-    kinetic_energy(u::EdgeField) -> CellField
+    kinetic_energy(u::EdgeField; closed_edges = nothing) -> CellField
 
 Allocating version of [`kinetic_energy!`](@ref).
 """
-kinetic_energy(u::EdgeField) = kinetic_energy!(similar_field(u, eltype(u), CellLoc()), u)
+kinetic_energy(u::EdgeField; closed_edges = nothing) =
+    kinetic_energy!(similar_field(u, eltype(u), CellLoc()), u; closed_edges = closed_edges)
 
 # --------------------------------------------------------------- PV flux
 
@@ -331,11 +362,23 @@ to one over the cells surrounding each vertex:
 (`n_i` = corner count of cell `i`; pentagons weight 1/5 vs 1/6 for
 hexagons.) `f = nothing` gives relative PV `ζ / h_v`. `out` must be a
 `VertexField` on the same mesh.
+
+`free_slip_vertices` (keyword, default `nothing`): vertices on a solid
+wall (an end vertex of a closed, no-flux edge) where the relative
+vorticity is set to ζ_v = 0 — the free-slip boundary condition of
+Adcroft & Marshall (1998, Tellus 50A, "How slippery are
+piecewise-constant coastlines in numerical ocean models?"). Without it
+the circulation around a wall vertex sees the zero normal velocity of
+the closed edges as a velocity jump, and a staircase (hexagon-zigzag)
+coastline acts as a NO-slip wall (measured: lock-exchange front speed
+halved in a 6-cell-wide channel).
 """
 function potential_vorticity!(out::VertexField, u::EdgeField, h::CellField,
-                              f::Union{Nothing, VertexField} = nothing)
+                              f::Union{Nothing, VertexField} = nothing;
+                              free_slip_vertices = nothing)
     mesh = h.mesh
     ζ = curl(u)
+    _free_slip!(ζ, free_slip_vertices)
     for v in 1:mesh.n_vertices
         num = 0.0
         den = 0.0
@@ -356,8 +399,19 @@ end
 Allocating version of [`potential_vorticity!`](@ref).
 """
 potential_vorticity(u::EdgeField, h::CellField,
-                    f::Union{Nothing, VertexField} = nothing) =
-    potential_vorticity!(similar_field(h, eltype(h), VertexLoc()), u, h, f)
+                    f::Union{Nothing, VertexField} = nothing;
+                    free_slip_vertices = nothing) =
+    potential_vorticity!(similar_field(h, eltype(h), VertexLoc()), u, h, f;
+                         free_slip_vertices = free_slip_vertices)
+
+"Set ζ_v = 0 on the wall vertices `vs` (free slip); no-op for `nothing`."
+_free_slip!(ζ, ::Nothing) = ζ
+function _free_slip!(ζ, vs)
+    for v in vs
+        ζ.data[v] = 0.0
+    end
+    return ζ
+end
 
 # ---------------------------------------------------------- upwind flux
 
@@ -542,11 +596,16 @@ Properties (checked in `test/gravity_current_benchmark_test.jl`):
   does not converge with refinement (the known O(1) truncation error
   of the TRiSK vector Laplacian on Voronoi meshes). Use it as a
   dissipation operator, not as an accurate ∇²u.
+
+`free_slip_vertices` (keyword): wall vertices with ζ_v = 0 (free-slip
+walls, see [`potential_vorticity!`](@ref)); the operator stays
+negative semi-definite (the ζ term becomes −Σ_{v∉wall} A_v ζ_v²).
 """
-function laplacian!(out::EdgeField, u::EdgeField)
+function laplacian!(out::EdgeField, u::EdgeField; free_slip_vertices = nothing)
     mesh = u.mesh
     div = divergence(u)                     # cell field [1/rad]
     ζ = curl(u)                             # vertex vorticity [1/rad]
+    _free_slip!(ζ, free_slip_vertices)
     for e in 1:mesh.n_edges
         v1 = mesh.edge_vertex_pos[e]        # t̂_e points toward v1
         v2 = mesh.edge_vertex_neg[e]        # the far end
@@ -569,6 +628,7 @@ end
 
 Allocating version of [`laplacian!`](@ref).
 """
-laplacian(u::EdgeField) = laplacian!(similar_field(u), u)
+laplacian(u::EdgeField; free_slip_vertices = nothing) =
+    laplacian!(similar_field(u), u; free_slip_vertices = free_slip_vertices)
 
 end # module TRiSK

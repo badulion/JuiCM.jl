@@ -12,7 +12,9 @@
 #   Huppert & Simpson 1980, Shin, Dalziel & Linden 2004 are both
 #   flat-bed). No bathymetry call is needed: H = H0 flat.
 #
-#   TWO configurations (documented operating points):
+#   THREE configurations (documented operating points); the rung-V3
+#   MEASUREMENT is the third, the walled channel (see its section below:
+#   closed, non-rotating, lock at one end — the laboratory geometry):
 #
 #   1. **Patch** (physics demonstration): a finite dense patch
 #      `|λ| < λ_lock, |φ| < φ_lock` releases a radially-spreading
@@ -92,7 +94,9 @@ using ..Ocean: ocean_state, ocean_step!, OceanState
 
 export lock_exchange_state, lock_channel_state, lock_channel_T,
        dense_fraction_profile, front_position, front_speed,
-       buoyancy_content, interface_monotone, gravity_current_benchmark!
+       buoyancy_content, interface_monotone, gravity_current_benchmark!,
+       walled_channel, walled_lock_state, walled_front_position,
+       walled_lock_exchange!
 
 # ------------------------------------------------------------- helpers
 
@@ -412,6 +416,157 @@ function gravity_current_benchmark!(state::OceanState, grid::VerticalGrid,
         if n % save_every == 0
             x, b = diag(state)
             push!(t, n * Δt); push!(xf, x); push!(buoy, b)
+        end
+    end
+    return (; state, t, xf, buoyancy = buoy)
+end
+
+# ============================================ walled channel (rung V3)
+#
+# The V3 measurement configuration: a CLOSED, non-rotating channel —
+# the laboratory geometry (Shin, Dalziel & Linden 2004: rectangular
+# tank, full-depth lock behind a gate at one end). Without side walls
+# the released current also spreads meridionally and the along-channel
+# front is not the 1-D lock-exchange front; on a rotating sphere it is
+# not the laboratory problem either. The channel is the equatorial
+# box |λ| < L/2, |φ| < W/2 of the Voronoi mesh; every edge between an
+# inside and an outside cell is a solid free-slip wall
+# (`ocean_step!(...; closed_edges)`). Cells outside stay at rest.
+
+"""
+    walled_channel(mesh; n_long = 60, n_wide = 24)
+        -> (; inside, closed_edges, λ_half, φ_half)
+
+Equatorial channel of `n_long × n_wide` mean cell spacings d̄_e:
+`inside[i]` is true for cells with |λ| < λ_half = n_long·d̄_e/2 and
+|φ| < φ_half = n_wide·d̄_e/2; `closed_edges` lists every edge with
+exactly one inside cell — the channel walls, passed to
+[`ocean_step!`](@ref) as `closed_edges`.
+"""
+function walled_channel(mesh; n_long::Real = 60, n_wide::Real = 24)
+    de = _mean_de(mesh)
+    λh = n_long * de / 2
+    φh = n_wide * de / 2
+    inside = falses(mesh.n_cells)
+    for i in 1:mesh.n_cells
+        λ, φ = _lonlat(mesh, i)
+        inside[i] = abs(λ) < λh && abs(φ) < φh
+    end
+    closed = [e for e in 1:mesh.n_edges
+              if inside[mesh.edge_cells[1, e]] != inside[mesh.edge_cells[2, e]]]
+    return (; inside, closed_edges = closed, λ_half = λh, φ_half = φh)
+end
+
+"""
+    walled_lock_state(mesh, grid, eos, ch; g_prime, lock_frac = 0.15,
+                      T_amb = 20.0) -> (state, λ_gate)
+
+At-rest full-depth lock in the walled channel `ch`
+([`walled_channel`](@ref)): dense water `T_amb − ΔT` (ΔT = g′/(gα)) in
+every layer of the inside cells west of the gate
+λ_gate = −λ_half + lock_frac·2λ_half, `T_amb` elsewhere, S = 35, flat
+bottom at the z* rest thicknesses.
+"""
+function walled_lock_state(mesh, grid::VerticalGrid, eos::LinearEOS, ch;
+                           g_prime::Real, lock_frac::Real = 0.15,
+                           T_amb::Real = 20.0)
+    ΔT = _ΔT(g_prime, eos)
+    K = nlayers(grid)
+    λg = -ch.λ_half + lock_frac * 2 * ch.λ_half
+    h = layer_thickness(grid, CellField(i -> 0.0, mesh))
+    T = LayeredCellField(mesh, K)
+    S = LayeredCellField(mesh, K)
+    for k in 1:K, i in 1:mesh.n_cells
+        T[k][i] = (ch.inside[i] && _lonlat(mesh, i)[1] < λg) ? T_amb - ΔT : T_amb
+        S[k][i] = 35.0
+    end
+    return ocean_state(LayeredEdgeField(mesh, K), h, T, S), λg
+end
+
+"""
+    walled_front_position(T, h, ch; T_amb, ΔT, λ_gate, frac = 0.1,
+                          bins_per_cell = 2) -> Real
+
+Front distance [m] from the gate in the walled channel: the inside
+cells' column dense fraction Σ h (T_amb − T)/(ΔT Σ h) is area-averaged
+in λ-bins (`bins_per_cell` per mean cell spacing; empty bins take the
+western neighbour), and the front is the EASTERNMOST down-crossing of
+`frac`, linearly interpolated between bin centres. Returns 0 if no
+crossing exists.
+"""
+function walled_front_position(T::LayeredCellField, h::LayeredCellField, ch;
+                               T_amb::Real, ΔT::Real, λ_gate::Real,
+                               frac::Real = 0.1, bins_per_cell::Integer = 2)
+    m = mesh_of(T)
+    K = nlayers(T)
+    R = williamson_constants().R
+    nb = max(2, round(Int, 2ch.λ_half / _mean_de(m) * bins_per_cell))
+    num = zeros(nb); den = zeros(nb)
+    for i in 1:m.n_cells
+        ch.inside[i] || continue
+        λ, _ = _lonlat(m, i)
+        b = clamp(floor(Int, (λ + ch.λ_half) / (2ch.λ_half) * nb) + 1, 1, nb)
+        dn = 0.0; col = 0.0
+        for k in 1:K
+            dn += h[k][i] * (T_amb - T[k][i])
+            col += h[k][i]
+        end
+        num[b] += m.cell_area[i] * dn / (ΔT * col)
+        den[b] += m.cell_area[i]
+    end
+    f = zeros(nb)
+    for b in 1:nb
+        f[b] = den[b] > 0 ? num[b] / den[b] : (b > 1 ? f[b - 1] : 1.0)
+    end
+    xc(b) = -ch.λ_half + (b - 0.5) * 2ch.λ_half / nb
+    for b in nb:-1:2
+        if f[b - 1] >= frac && f[b] < frac
+            λf = xc(b - 1) + (f[b - 1] - frac) / (f[b - 1] - f[b]) * (xc(b) - xc(b - 1))
+            return (λf - λ_gate) * R
+        end
+    end
+    return 0.0
+end
+
+"""
+    walled_lock_exchange!(state, grid, eos, ch, T_amb, ΔT, λ_gate;
+                          n_steps, Δt, save_every = 1,
+                          fracs = (0.02, 0.1, 0.25), nu_h = 0.0,
+                          regrid = true, step_kwargs = (;))
+        -> (; state, t, xf, buoyancy)
+
+Run the walled-channel lock exchange (rung V3): `n_steps`
+[`ocean_step!`](@ref) calls of `Δt` [s] with the channel walls
+(`closed_edges = ch.closed_edges`), NO rotation (`Omega = 0`; the
+laboratory problem), z* regridding and the shock-sensor viscosity cap
+`nu_h`. Records the front positions [m] for every threshold in `fracs`
+([`walled_front_position`](@ref); `xf[j]` is the series for
+`fracs[j]`) and the buoyancy content ([`buoyancy_content`](@ref)) at
+t = 0 and every `save_every` steps. Returns the final state.
+"""
+function walled_lock_exchange!(state::OceanState, grid::VerticalGrid,
+                               eos::LinearEOS, ch, T_amb::Real, ΔT::Real,
+                               λ_gate::Real; n_steps::Integer, Δt::Real,
+                               save_every::Integer = 1,
+                               fracs = (0.02, 0.1, 0.25), nu_h::Real = 0.0,
+                               regrid::Bool = true,
+                               step_kwargs::NamedTuple = (;))
+    kw = merge((; Omega = 0.0, nu_h = nu_h, regrid = regrid,
+                  closed_edges = ch.closed_edges), step_kwargs)
+    fronts(st) = [walled_front_position(st.T, st.h, ch; T_amb = T_amb, ΔT = ΔT,
+                                        λ_gate = λ_gate, frac = fr)
+                  for fr in fracs]
+    t = Float64[0.0]
+    xf = [Float64[x] for x in fronts(state)]
+    buoy = Float64[buoyancy_content(state.T, state.h; T_amb = T_amb)]
+    for n in 1:n_steps
+        state = ocean_step!(state, grid, eos, (n - 1) * Δt, Δt; kw...)
+        if n % save_every == 0
+            push!(t, n * Δt)
+            for (j, x) in enumerate(fronts(state))
+                push!(xf[j], x)
+            end
+            push!(buoy, buoyancy_content(state.T, state.h; T_amb = T_amb))
         end
     end
     return (; state, t, xf, buoyancy = buoy)
