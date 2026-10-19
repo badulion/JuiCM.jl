@@ -73,6 +73,33 @@
 #     instability during #30 development; the column-mean transport is
 #     carried entirely by the fast mode, and the baroclinic volume
 #     redistribution reaches the layers through the re-stretch below.)
+#
+#   Complete-tendency projection and barotropic forcing (issue #40;
+#   MPAS-O split-explicit class, Higdon 2005; Ringler et al. 2013 §3):
+#   `ocean_step!` removes the thickness-weighted depth-mean of the
+#   COMPLETE slow momentum tendency (pressure, Coriolis/Bernoulli,
+#   viscosity, drag — `ocean_tendency!(...; projection = :full)`), so
+#   u′ stays depth-mean free, and forces the fast mode with the part of
+#   that depth-mean that is not the surface-pressure force:
+#     G = ⟨∂u/∂t⟩(state) − ⟨∂u/∂t⟩(uniform density, u′ = 0)
+#   (evaluated once at the step start, held over the substeps; the
+#   reference evaluation is the slow operator's own response to η, so
+#   G carries no surface-wave force). The fast state is carried as the
+#   time-filtered pair (η̄, ū̄) — both averaged with the same trapezoid
+#   weights — and the layers are re-projected after the step so that
+#   their depth-mean velocity equals ū̄. Measured in the closed #40
+#   channel: the pressure-only projection left 3 m/s of momentum-
+#   without-mass depth-mean flow and a wedge-shaped dense current
+#   (F = 0.28); the forced, filtered split has ⟨u⟩ = ū to round-off
+#   and F = 0.48 (rung V3). Restarting from the filtered η̄ with the
+#   unfiltered ū_end amplifies forced barotropic waves (measured
+#   ×6 per 6 h) — hence the filtered pair.
+#
+#   Solid walls (`closed_edges`): normal velocity tendencies (layers
+#   and fast mode) are zeroed on wall edges, relative vorticity is zero
+#   at wall vertices (free slip; Adcroft & Marshall 1998 — a staircase
+#   hexagon coastline is otherwise effectively no-slip), and wall cells
+#   average the kinetic energy over their open edges.
 #   coupling (step end): the depth-mean of the layers is REPLACED with
 #     the fast solver's ū_end (u_k = u′_k + ū_end; the slow system's
 #     barotropic velocity DOF is unphysical — its force was frozen —
@@ -183,7 +210,7 @@ import ..TimeStepping: _stage, _lincomb!, _axpy!
 
 export OceanState, ocean_state, ocean_tendency!, ocean_step!,
        ocean_integrate!, ocean_volume, ocean_kinetic_energy,
-       ocean_ssh
+       ocean_ssh, wall_vertices
 
 # ---------------------------------------------------------------- state
 
@@ -300,7 +327,10 @@ ocean_ssh(grid::VerticalGrid, s::OceanState) = s.eta
 """
     ocean_tendency!(out::OceanState, state::OceanState; grid, eos,
                     eta = nothing, Omega = nothing, nu_h = 0.0,
-                    c_drag = 0.0, advect_tracers = true) -> OceanState
+                    c_drag = 0.0, advect_tracers = true,
+                    free_slip_vertices = nothing, ke_closed_edges = nothing,
+                    depth_mean_out = nothing, projection = :pressure)
+        -> OceanState
 
 Baroclinic (slow) tendency of the layered system — see the module
 header for the equation set and scaled-variable assembly. `state.u`
@@ -338,14 +368,20 @@ Optional dissipation (issue #40; both 0 = off, the #30 dynamics):
   the SSPRK, the thickness floor acts once per step) gives a finite,
   always-decelerating drag.
 
-Both act on the anomaly velocity u′ AFTER the baroclinic projection:
-their depth-mean part is not projected out, so it stays in u′ (the
-driver adds ū_end to u′ without removing u′'s own column mean) — it
-decelerates the layers but never reaches the fast mode (ū, η), and the
-column transport it induces is overwritten by the re-stretch. For the
-collapsed-sheet drag (sheets ≤ 5% of the column) this is a small
-effect; a bottom-drag on ū would belong to the fast solver (not
-implemented).
+Projection (`projection`):
+
+- `:pressure` (default; the #30 form for direct callers) — only the
+  depth-mean of the pressure force is removed; the Coriolis/Bernoulli,
+  viscosity and drag terms keep their depth-mean.
+- `:full` (used by [`ocean_step!`](@ref)) — the depth-mean of the
+  COMPLETE momentum tendency is removed (u′ stays depth-mean free) and
+  written into `depth_mean_out` (an `EdgeField`, if given), from which
+  the driver forms the barotropic forcing (module header).
+
+Walls: `free_slip_vertices` (vertex indices; ζ = 0 there in the PV and
+the viscous Laplacian) and `ke_closed_edges` (edge indices; wall cells
+average the kinetic energy over open edges) — see
+[`wall_vertices`](@ref) and `ocean_step!(...; closed_edges)`.
 
 Requires all of `state`'s ghost slots to be current in a partitioned
 run (single-region in #30; the partitioned driver lands with #45).
@@ -353,8 +389,12 @@ run (single-region in #30; the partitioned driver lands with #45).
 function ocean_tendency!(out::OceanState, state::OceanState;
                          grid::VerticalGrid, eos::AbstractOceanEOS,
                          eta = nothing, Omega = nothing, nu_h::Real = 0.0,
-                         c_drag::Real = 0.0, advect_tracers::Bool = true)
+                         c_drag::Real = 0.0, advect_tracers::Bool = true,
+                         free_slip_vertices = nothing, ke_closed_edges = nothing,
+                         depth_mean_out = nothing, projection::Symbol = :pressure)
     mesh = mesh_of(state.h)
+    projection in (:pressure, :full) ||
+        throw(ArgumentError("ocean_tendency!: projection must be :pressure or :full"))
     (; R, g) = williamson_constants()
     Ω = Omega === nothing ? williamson_constants().Omega : Omega
     K = nlayers(state.h)
@@ -422,11 +462,12 @@ function ocean_tendency!(out::OceanState, state::OceanState;
         #   −∇(p̄_k/ρ0)/R² − (g ρ_k/ρ0)·∇z̄_k/R²  (NO Cor/KE yet)
         q = potential_vorticity(us[k], hs[k],
                                 VertexField(v -> 2 * Ω *
-                                                mesh.vertex_xyz[3, v], mesh))
+                                                mesh.vertex_xyz[3, v], mesh);
+                                free_slip_vertices = free_slip_vertices)
         Cor = pv_flux(q, Fk)
         du = gradient(pbar)                # [m²/s²/rad]
         bz = edge_mean(rho_frac) * gradient(zbar[k])   # (ρ_k/ρ0)∇z̄ [m/rad]
-        Kk = kinetic_energy(us[k])
+        Kk = kinetic_energy(us[k]; closed_edges = ke_closed_edges)
         lincomb!(out.u[k], -1.0 / R^2, du, 0.0, du)  # −∇(p̄/ρ0)/R²
         axpy!(out.u[k], -g / R^2, bz)      # − b ∇z̄_k
         scale!(out.u[k], R)                # → [m/s²]
@@ -440,34 +481,12 @@ function ocean_tendency!(out::OceanState, state::OceanState;
         axpy!(pacc, 1.0, rho_frac * state.h[k])
     end
 
-    # ------------------------------------------------ baroclinic
-    # projection (exact, discrete): subtract the thickness-weighted
-    # depth-mean of the pressure force. In the continuum the depth-mean
-    # of the hydrostatic PGF is exactly −g∇η̂; discretely the layer
-    # weighting (ρ_k, z̄_k, edge means) makes it only approximately
-    # −g∇η̂, and the RESIDUAL (layer-dependent, half-strength barotropic
-    # force) is what destabilizes the split. Subtracting the actual
-    # discrete depth-mean removes the barotropic mode of the DISCRETE
-    # system exactly (uniform-density resting state still exact: the
-    # force is zero before the projection).
-    htot = similar_field(state.h[1])
-    fill!(htot, 0.0)
+    # re-attach the Coriolis/Bernoulli terms: out.u = full slow
+    # momentum tendency (pressure + Coriolis/Bernoulli; viscosity and
+    # drag follow). Its depth-mean is removed at the END (baroclinic
+    # projection, below) — ALL terms, not only the pressure force.
+    projection === :pressure && _remove_depth_mean!(out.u, state.h, nothing)
     for k in 1:K
-        axpy!(htot, 1.0, state.h[k])               # [m]
-    end
-    dent = edge_mean(htot)
-    fmean = similar_field(out.u[1])
-    fill!(fmean, 0.0)
-    for k in 1:K
-        axpy!(fmean, 1.0, edge_mean(state.h[k]) * out.u[k])   # [m³/s⁴]·R
-    end
-    for i in eachindex(fmean)
-        fmean[i] = fmean[i] / dent[i]
-    end                                            # depth-mean [m/s²]
-    for k in 1:K
-        axpy!(out.u[k], -1.0, fmean)
-        # re-attach the Coriolis/Bernoulli terms (baroclinic dynamics —
-        # these are the anomaly momentum, not the pressure force)
         axpy!(out.u[k], 1.0, cors[k])
     end
 
@@ -500,7 +519,7 @@ function ocean_tendency!(out::OceanState, state::OceanState;
     if nu_h != 0.0
         mesh = mesh_of(us[1])
         for k in 1:K
-            lapu = laplacian(us[k])            # [u-units/rad²]
+            lapu = laplacian(us[k]; free_slip_vertices = free_slip_vertices)
             for e in 1:mesh.n_edges
                 # Laplacian-magnitude shock sensor (residual-based
                 # artificial dissipation): ν_e = min(ν_h, d_e³ R² |L_e|).
@@ -559,6 +578,25 @@ function ocean_tendency!(out::OceanState, state::OceanState;
         end
     end
 
+    # ------------------------------------------------ baroclinic
+    # projection (exact, discrete; MPAS-O split-explicit class,
+    # Higdon 2005 / Ringler et al. 2013 §3): subtract the thickness-
+    # weighted depth-mean of the COMPLETE slow momentum tendency
+    # (pressure, Coriolis/Bernoulli, viscosity, drag), so the anomaly
+    # u′ stays depth-mean free and the barotropic DOF lives only in the
+    # fast solver. The removed mean is returned in `depth_mean_out`
+    # (when given): ocean_step! forces the fast mode with it. Removing
+    # only the pressure-force mean (the pre-#40 form) left the depth-
+    # mean of −Q̂⊥ − ∇K in u′ — a spurious barotropic velocity that
+    # carries momentum but no mass, opposed by no pressure (measured:
+    # |⟨u⟩ − ū| = 3 m/s in the closed lock-exchange channel, the
+    # dense current dragged into a slow wedge).
+    if projection === :full
+        _remove_depth_mean!(out.u, state.h, depth_mean_out)
+    elseif depth_mean_out !== nothing
+        fill!(depth_mean_out, 0.0)
+    end
+
     # T and S. advect_tracers = true: the #32 flux-form upwind
     # tendency with the SAME layer fluxes the continuity used
     # (compatibility by construction — Tracers.jl module header; the
@@ -595,24 +633,25 @@ target ones ĥ^d_k (edge means of `hdst`, the z* layers). The two
 columns must have the same total (it is enforced to round-off: the
 bottom target interface is set to the source one).
 
-Flux form, with interface depths z_k measured downward from the
-surface (z_1 = 0, z_{k+1} = z_k + ĥ_k): interior interface k moves by
-d_k = z^d_k − z^s_k, and the swept volume d_k carries the DONOR
-layer's MC-limited piecewise-linear face value with the van Leer
-Courant correction (donor m = k if d_k > 0, else k − 1):
+Exact overlap remap ([`_overlap_remap!`](@ref)), with interface depths
+z_k measured downward from the surface (z_1 = 0, z_{k+1} = z_k + ĥ_k):
+each source layer m carries the MC-limited piecewise-linear profile
 
-    s_m  = MC(u_m − u_{m−1}, u_{m+1} − u_m)
-    u_f  = u_m ∓ ½ s_m (1 − |d_k|/ĥ^s_m)         (− if d_k > 0)
-    ĥ^d_k u_k ← ĥ^s_k u_k + d_{k+1} u_f,{k+1} − d_k u_f,k
+    u(ξ) = u_m + s_m (ξ − ½),  ξ ∈ [0, 1] across the layer,
+    s_m  = MC(u_m − u_{m−1}, u_{m+1} − u_m)   (s = 0 in the top and
+                                               bottom layers)
 
-(MC = monotonized-central limiter, `TracerFCT._mc`; van Leer 1977).
-Each interface transfer is one number seen by both layers, so the
-column momentum Σ_k ĥ_k u_k is conserved exactly (round-off). The
-face value lies between the donor's and the receiver's velocities, so
-for |d_k| ≤ ĥ^s_m (the per-step interface excursion of the z* regrid
-is a small fraction of a layer) the remap creates no new extrema. This
-is the piecewise-linear member of the limited remap family used by
-MOM6's ALE (White & Adcroft 2008) and MPAS-O's z* vertical transport.
+(MC = monotonized-central limiter, `TracerFCT._mc`; van Leer 1977), and
+each target layer receives the exact integral of that profile over its
+overlap with every source layer. The source integrals partition the
+column, so Σ_k ĥ_k u_k is conserved exactly (round-off), and every
+reconstructed value lies between neighbouring layer means, so the
+remap creates no new extrema — for ANY interface displacement. (The
+#62 flux form, one swept-volume flux per interface, was valid only for
+|d_k| ≤ ĥ_donor; with thin layers (60 z* levels, 3.3 m) the lock-
+exchange interface swept more than a layer per step and the momentum
+remap went unstable: measured NaN at day 6.) This is the piecewise-
+linear member of the remap family of MOM6's ALE (White & Adcroft 2008).
 
 Per-edge scalar loop through `Field[i]` getindex (AGENTS.md rule 3).
 """
@@ -623,6 +662,7 @@ function _remap_edge_columns!(u::LayeredEdgeField, hsrc::LayeredCellField,
         throw(ArgumentError("_remap_edge_columns!: layer counts differ"))
     mesh = mesh_of(u)
     zs = zeros(K + 1); zd = zeros(K + 1); uc = zeros(K); q = zeros(K)
+    sl = zeros(K)
     for e in 1:mesh.n_edges
         i, j = mesh.edge_cells[1, e], mesh.edge_cells[2, e]
         for k in 1:K
@@ -632,18 +672,7 @@ function _remap_edge_columns!(u::LayeredEdgeField, hsrc::LayeredCellField,
             q[k] = (zs[k + 1] - zs[k]) * uc[k]
         end
         zd[K + 1] = zs[K + 1]                 # identical totals (round-off)
-        for k in 2:K
-            d = zd[k] - zs[k]                 # > 0: source k → target k−1
-            d == 0 && continue
-            m = d > 0 ? k : k - 1             # donor layer
-            hm = zs[m + 1] - zs[m]
-            up = m > 1 ? uc[m] - uc[m - 1] : 0.0
-            dn = m < K ? uc[m + 1] - uc[m] : 0.0
-            c = hm > 0 ? min(1.0, abs(d) / hm) : 1.0
-            uf = uc[m] + (d > 0 ? -0.5 : 0.5) * _mc(up, dn) * (1 - c)
-            q[k - 1] += d * uf
-            q[k] -= d * uf
-        end
+        _overlap_remap!(q, zs, uc, zd, sl)
         for k in 1:K
             hk = zd[k + 1] - zd[k]
             u[k][e] = hk > 0 ? q[k] / hk : uc[k]
@@ -652,14 +681,103 @@ function _remap_edge_columns!(u::LayeredEdgeField, hsrc::LayeredCellField,
     return u
 end
 
+"""
+    _overlap_remap!(q, zs, c, zd, sl) -> q
+
+Conservative overlap remap of one column: source layer means `c` on the
+interfaces `zs` (length K+1, non-decreasing, downward) to the target
+interfaces `zd` (same end points). Writes the target layer CONTENTS
+(∫ c dz) into `q`; `sl` is a length-K slope scratch. Piecewise-linear
+MC-limited reconstruction, zero slope in the end layers (see
+[`_remap_edge_columns!`](@ref)).
+"""
+function _overlap_remap!(q, zs, c, zd, sl)
+    K = length(c)
+    for m in 1:K
+        sl[m] = (1 < m < K) ? _mc(c[m] - c[m - 1], c[m + 1] - c[m]) : 0.0
+    end
+    fill!(q, 0.0)
+    m = 1
+    for k in 1:K
+        a, b = zd[k], zd[k + 1]
+        b > a || continue
+        while m < K && zs[m + 1] <= a
+            m += 1
+        end
+        mm = m
+        while mm <= K && zs[mm] < b
+            lo = max(a, zs[mm]); hi = min(b, zs[mm + 1])
+            hm = zs[mm + 1] - zs[mm]
+            if hi > lo && hm > 0
+                ξ = ((lo + hi) / 2 - zs[mm]) / hm   # overlap midpoint
+                q[k] += (hi - lo) * (c[mm] + sl[mm] * (ξ - 0.5))
+            end
+            mm += 1
+        end
+    end
+    return q
+end
+
 # -------------------------------------------------------------- drivers
+
+"""
+    _remove_depth_mean!(u, h, mean_out) -> u
+
+Subtract from every layer of the edge tendency `u` its thickness-
+weighted depth-mean Σ_k ĥ_k u_k / Σ_k ĥ_k (ĥ = edge_mean(h)); write the
+removed mean into `mean_out` unless it is `nothing`.
+"""
+function _remove_depth_mean!(u, h, mean_out)
+    K = nlayers(u)
+    htot = similar_field(h[1])
+    fill!(htot, 0.0)
+    for k in 1:K
+        axpy!(htot, 1.0, h[k])
+    end
+    dent = edge_mean(htot)
+    fmean = similar_field(u[1])
+    fill!(fmean, 0.0)
+    for k in 1:K
+        axpy!(fmean, 1.0, edge_mean(h[k]) * u[k])
+    end
+    for i in eachindex(fmean)
+        fmean[i] = dent[i] != 0 ? fmean[i] / dent[i] : 0.0
+    end
+    for k in 1:K
+        axpy!(u[k], -1.0, fmean)
+    end
+    mean_out === nothing || copyto!(mean_out, fmean)
+    return u
+end
+
+"""
+    wall_vertices(mesh, closed_edges) -> Union{Nothing, Vector{Int}}
+
+The vertices on solid walls: every end vertex of a closed (no-flux)
+edge, sorted and unique; `nothing` for `closed_edges = nothing`.
+[`ocean_step!`](@ref) applies the free-slip condition ζ_v = 0 there
+(Adcroft & Marshall 1998; see `TRiSK.potential_vorticity!`).
+"""
+wall_vertices(mesh, ::Nothing) = nothing
+wall_vertices(mesh, closed) =
+    sort!(unique!([v for e in closed
+                   for v in (mesh.edge_vertex_pos[e], mesh.edge_vertex_neg[e])]))
+
+"Zero the edge field `f` on the wall edges `closed` (no-op for `nothing`)."
+_close_edges!(f, ::Nothing) = f
+function _close_edges!(f, closed)
+    for e in closed
+        f[e] = 0.0
+    end
+    return f
+end
 
 """
     ocean_step!(state::OceanState, grid, eos, t, Δt;
                 n_sub = nothing, cfl = 0.3, Omega = nothing,
                 nu_h = 0.0, c_drag = 0.0, min_h_frac = 0.0,
                 tracer_advection = :fct, floor_stats = nothing,
-                regrid = false)
+                regrid = false, closed_edges = nothing)
         -> OceanState
 
 Advance one mode-split step of Δt [s] (single-region state):
@@ -714,6 +832,18 @@ Keywords:
   re-stretched with fractions preserved (the #30 behaviour the layered
   internal-wave tests exercise).
 
+- `closed_edges` — `nothing` (default: every edge open, the closed
+  sphere) or a collection of edge indices that are solid walls
+  (no-flux / no-normal-flow lateral boundaries: channels, basins,
+  coastlines). The normal-velocity tendency of every layer AND of the
+  fast barotropic mode is zeroed on these edges, so an input state with
+  u = ū = 0 there keeps u ≡ 0: the mass flux ĥu, the tracer flux and
+  the vertical remap of u vanish across the wall exactly (volume and
+  tracer content of each enclosed region are conserved separately).
+  Tangential (vorticity) terms see u = 0 on the wall — the TRiSK
+  free-slip wall of Ringler et al. (2010) §6 class. The input state
+  must already have u = ū = 0 on closed edges.
+
 Requires a column-consistent input state (Σ_k h_k − H0 = η, which
 every `ocean_step!` output satisfies) for the `:fct` budget to be
 exact. Split scheme documented in the module header (Lie splitting,
@@ -724,7 +854,8 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
                      n_sub = nothing, cfl::Real = 0.3, Omega = nothing,
                      nu_h::Real = 0.0, min_h_frac::Real = 0.0,
                      c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
-                     floor_stats = nothing, regrid::Bool = false)
+                     floor_stats = nothing, regrid::Bool = false,
+                     closed_edges = nothing)
     mesh = mesh_of(state.h)
     (; R, g) = williamson_constants()
     H0 = grid.H0
@@ -737,6 +868,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
                             "$K layers puts the resting column below the " *
                             "floor (need 0 ≤ min_h_frac·K < 1)"))
     use_fct = tracer_advection === :fct
+    wallv = wall_vertices(mesh, closed_edges)
     (regrid && !use_fct) &&
         throw(ArgumentError("ocean_step!: regrid = true requires " *
                             "tracer_advection = :fct (the tracer remap is " *
@@ -780,8 +912,59 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     Fbt = fill!(similar_field(ubar0), 0.0)        # [m²/s]
     wsub = Ref(0.0)
     fstage = Ref(0)
+
+    # --- barotropic forcing (split-explicit, MPAS-O class): the depth-
+    # mean of the slow momentum tendency at the step start that is NOT
+    # the surface-pressure force −g∇η (the fast solver's own term):
+    #   G = ⟨∂u/∂t⟩(state) − ⟨∂u/∂t⟩(state with ρ ≡ ρ0, u′ = 0),
+    # held fixed over the substeps. The reference evaluation has uniform
+    # density and no anomaly flow, so its depth-mean is exactly the
+    # slow operator's discrete response to η alone; subtracting it
+    # removes the η-dependence with the SAME discretization. (Subtracting
+    # the fast solver's −g∇η instead leaves the slow/fast discretization
+    # mismatch — the layer-weighted depth-mean PGF is only approximately
+    # −g∇η — in G as a lagged, step-frozen surface-wave force: measured
+    # exponential barotropic blow-up, |ū| → 900 m/s in 2 days, faster
+    # with more substeps.) G carries the baroclinic pressure, Coriolis/
+    # Bernoulli, viscosity and drag depth-means; without it the fast mode
+    # never feels them and, in a closed basin, the barotropic response
+    # that cancels them is missing.
+    G = fill!(similar_field(ubar0), 0.0)
+    begin
+        start = copy(state)
+        for k in 1:K
+            axpy!(start.u[k], -1.0, ubar0)     # anomaly u′ at the start
+        end
+        tend0 = copy(start)
+        ocean_tendency!(tend0, start; grid = grid, eos = eos, eta = eta0,
+                        Omega = Omega, nu_h = nu_h, c_drag = c_drag,
+                        advect_tracers = false, free_slip_vertices = wallv,
+                        ke_closed_edges = closed_edges, depth_mean_out = G,
+                        projection = :full)
+        # uniform reference water mass (ρ ≡ ρ0 for the linear EOS; any
+        # uniform T/S for a general EOS — only its uniformity matters)
+        Tr = hasproperty(eos, :T_ref) ? eos.T_ref : state.T[1][1]
+        Sr = state.S[1][1]
+        ref = copy(start)
+        for k in 1:K
+            fill!(ref.u[k], 0.0)
+            fill!(ref.T[k], Tr)
+            fill!(ref.S[k], Sr)
+        end
+        Gref = similar_field(ubar0)
+        ocean_tendency!(copy(ref), ref; grid = grid, eos = eos, eta = eta0,
+                        Omega = Omega, nu_h = nu_h, c_drag = c_drag,
+                        advect_tracers = false, free_slip_vertices = wallv,
+                        ke_closed_edges = closed_edges, depth_mean_out = Gref,
+                        projection = :full)
+        axpy!(G, -1.0, Gref)
+        _close_edges!(G, closed_edges)
+    end
+
     function Lfast(out, s, τ)
         sw_tendency!(out, s)               # == sw_step!'s L (no physics)
+        axpy!(out.u, 1.0, G)               # baroclinic → barotropic forcing
+        _close_edges!(out.u, closed_edges)
         if use_fct
             fstage[] = fstage[] % 3 + 1
             axpy!(Fbt, wsub[] * ssprk_b[fstage[]], edge_mean(s.h) * s.u)
@@ -790,18 +973,29 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     end
     eta_mean = lincomb!(similar_field(eta0), 1.0,
                         fill!(similar_field(eta0), H0 / 2), 0.5, eta0)
+    ubar_mean = lincomb!(similar_field(ubar0), 0.5, ubar0, 0.0, ubar0)
     for n in 1:n_sub
         wsub[] = (n_sub - n + 0.5) / n_sub^2
         fast = ssprk3_step!(Lfast, fast, t + (n - 1) * Δtf, Δtf)
         if n < n_sub
             axpy!(eta_mean, 1.0, fast.h)   # accumulate H0 + η_n
+            axpy!(ubar_mean, 1.0, fast.u)
         end
     end
     axpy!(eta_mean, 0.5, fast.h)           # + η_end/2 (trapezoid close)
     scale!(eta_mean, 1.0 / n_sub)          # [m]: time-mean (H0 + η)
+    axpy!(ubar_mean, 0.5, fast.u)
+    scale!(ubar_mean, 1.0 / n_sub)         # time-mean ū (same weights)
     eta1 = lincomb!(similar_field(eta0), 1.0, eta_mean,
                     -1.0, fill!(similar_field(eta0), H0))  # η̄ = mean − H0
-    ubar1 = fast.u                         # end-of-step fast ū
+    # time-mean ū with the SAME trapezoid weights as η̄: the fast state
+    # is carried as the filtered pair (η̄, ū̄) — MPAS-O split-explicit
+    # (Ringler et al. 2013 §3c) restarts the barotropic subcycle from the
+    # time-averaged state. Pairing the filtered η̄ with the instantaneous
+    # end-of-step ū (the pre-#40 form) is an amplifying restart for
+    # barotropic waves once they are forced (measured with the
+    # barotropic forcing G: exponential blow-up ×6 per 6 h).
+    ubar1 = ubar_mean
 
     # --- slow mode: baroclinic SSPRK(3,3) on the anomalies u′ = u − ū ---
     # ū_start removed before the step, ū_end attached after
@@ -815,7 +1009,12 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     function L(out, s, τ)
         ocean_tendency!(out, s; grid = grid, eos = eos, eta = eta0,
                         Omega = Omega, nu_h = nu_h, c_drag = c_drag,
-                        advect_tracers = !use_fct)
+                        advect_tracers = !use_fct,
+                        free_slip_vertices = wallv,
+                        ke_closed_edges = closed_edges, projection = :full)
+        for k in 1:K
+            _close_edges!(out.u[k], closed_edges)
+        end
         if use_fct
             sstage[] = sstage[] % 3 + 1
             for k in 1:K
@@ -918,6 +1117,27 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         else
             fct_advect_tracer!(work.T, state.h, work.h, u_tr, Δt)
             fct_advect_tracer!(work.S, state.h, work.h, u_tr, Δt)
+        end
+    end
+
+    # --- re-projection: the layers' thickness-weighted depth-mean
+    # velocity must equal the fast solver's ū (u′ depth-mean free).
+    # The projected tendencies keep it so up to the stage/thickness
+    # mismatch of the SSPRK stages and the re-stretch/remap; remove the
+    # residual so no momentum-without-mass barotropic flow accumulates.
+    let hm = [edge_mean(work.h[k]) for k in 1:K]
+        for e in eachindex(work.ubar)
+            num = 0.0
+            den = 0.0
+            for k in 1:K
+                num += hm[k][e] * work.u[k][e]
+                den += hm[k][e]
+            end
+            den > 0 || continue
+            d = num / den - work.ubar[e]
+            for k in 1:K
+                work.u[k][e] -= d
+            end
         end
     end
 
@@ -1062,7 +1282,7 @@ end
                      n_sub = nothing, Omega = nothing, nu_h = 0.0,
                      min_h_frac = 0.0, c_drag = 0.0,
                      tracer_advection = :fct, floor_stats = nothing,
-                     regrid = false)
+                     regrid = false, closed_edges = nothing)
         -> OceanState
 
 Integrate `n_steps` equal mode-split steps (see [`ocean_step!`](@ref)
@@ -1073,14 +1293,16 @@ function ocean_integrate!(state::OceanState, grid::VerticalGrid,
                           n_steps::Integer; n_sub = nothing, Omega = nothing,
                           nu_h::Real = 0.0, min_h_frac::Real = 0.0,
                           c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
-                          floor_stats = nothing, regrid::Bool = false)
+                          floor_stats = nothing, regrid::Bool = false,
+                          closed_edges = nothing)
     Δt = (t_final - t0) / n_steps
     for n in 1:n_steps
         state = ocean_step!(state, grid, eos, t0 + (n - 1) * Δt, Δt;
                             n_sub = n_sub, Omega = Omega, nu_h = nu_h,
                             min_h_frac = min_h_frac, c_drag = c_drag,
                             tracer_advection = tracer_advection,
-                            floor_stats = floor_stats, regrid = regrid)
+                            floor_stats = floor_stats, regrid = regrid,
+                            closed_edges = closed_edges)
     end
     return state
 end
