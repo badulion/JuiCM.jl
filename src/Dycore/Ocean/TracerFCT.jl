@@ -72,11 +72,29 @@
 # the inflow side and the upwind value on the outflow side of the same
 # interface — two different numbers, a content source/sink ∝ the
 # vertical curvature of C; the "clip" of a centered mean into its two
-# flanks was also a no-op.) A limited second-order vertical flux is a
-# follow-up; the #36 acceptance tests have no vertical tracer
-# gradient under vertical motion, so they do not distinguish the two.
+# flanks was also a no-op.) The #36 acceptance tests have no vertical
+# tracer gradient under vertical motion, so they do not distinguish
+# upwind from a higher-order vertical flux.
 # Surface closure: flow through the top of layer 1 carries layer 1's
 # own concentration (#32); the bottom is closed.
+#
+# Vertical, second order (#62, `vertical_order = 2`): the interface
+# value is the donor layer's MC-limited piecewise-linear
+# reconstruction evaluated with the van Leer Courant correction
+# (layer index increasing downward, d = donor layer, c = |w|Δt/h^hor_d):
+#
+#   s_d    = MC(C_d − C_{d−1}, C_{d+1} − C_d)
+#   C_face = C_d ± ½ s_d (1 − c)    (+ for downward flow, − for upward)
+#
+# with the monotonized-central limiter (van Leer 1977)
+#   MC(a, b) = 0 if ab ≤ 0, else sign(a)·min(2|a|, 2|b|, |a + b|/2).
+# The face value stays between the donor's and the receiving layer's
+# concentrations, and it is still ONE number per interface, so column
+# content stays exact. This is the vertical remap step of the z* ALE
+# regrid (`ocean_step!(…; regrid = true)`: the MPAS-O/MOM6 z*
+# coordinate with a limited piecewise-linear remap, White & Adcroft
+# 2008 class), where the residual-diagnosed vertical transport is a
+# full layer-to-target remap rather than a small correction.
 #
 # Column-conservative bound: when the residual-driven outflow volume
 # Δt·w exceeds the thickness h^horiz of a thin layer (measured #40: a
@@ -112,6 +130,12 @@
 # - Skamarock, W.C. (2008): "A linear analysis of FCT-limited
 #   advection on the sphere in flux form", Mon. Wea. Rev. 136, 372–384
 #   (donor-gradient / flex-PG flux form on C-grids).
+# - van Leer, B. (1977): "Towards the ultimate conservative difference
+#   scheme IV", J. Comput. Phys. 23, 276–299 (MC limiter, PLM with
+#   Courant correction).
+# - White, L., Adcroft, A. (2008): "A high-order finite volume
+#   remapping scheme for nonuniform grids", J. Comput. Phys. 227,
+#   7394–7422 (limited piecewise-polynomial vertical remap, MOM6 ALE).
 # - Thuburn, J., Ringler, T.D., Klemp, J.B., Skamarock, W.C. (2014):
 #   "A numerical framework for the solution of the primitive equations
 #   on an unstructured mesh", J. Comput. Phys. 262, 1–24.
@@ -130,6 +154,18 @@ using ..Vertical: VerticalGrid
 export fct_advect_tracer!
 
 _default_R() = 6.37122e6
+
+"""
+    _mc(a, b) -> Float64
+
+Monotonized-central (MC) limited slope from the two one-sided
+differences `a` (upper) and `b` (lower) (van Leer 1977):
+`0` if `a·b ≤ 0`, else `sign(a)·min(2|a|, 2|b|, |a + b|/2)`. Shared by
+the `vertical_order = 2` FCT vertical flux and the z* momentum remap
+of `ocean_step!`.
+"""
+_mc(a, b) = a * b <= 0 ? 0.0 :
+            sign(a) * min(2 * abs(a), 2 * abs(b), abs(a + b) / 2)
 
 # ------------------------------------------------------- flux assembly
 
@@ -289,7 +325,8 @@ end
     fct_advect_tracer!(C::LayeredCellField, h_old::LayeredCellField,
                        h_new::LayeredCellField, u::LayeredEdgeField,
                        Δt::Real; R = 6.37122e6,
-                       clip_residual = nothing) -> LayeredCellField
+                       clip_residual = nothing,
+                       vertical_order = 1) -> LayeredCellField
 
 Advance a layered tracer one FCT step of Δt [s] in place — the
 production scheme of #36 (Zalesak 1979 FCT with donor-gradient
@@ -310,6 +347,11 @@ Guards (module header, "Column-conservative bound" and "Drained cells"):
   pre-step concentration over its 2-ring in layers k−1:k+1 and
   redistributes the clipped content within the column.
 
+`vertical_order` selects the interior interface value of the vertical
+flux: `1` (default) — upwind; `2` — MC-limited piecewise-linear donor
+reconstruction with the Courant correction (module header; used by
+the z* regrid of `ocean_step!`). Both are single-valued per interface.
+
 Column content is conserved exactly unless a column cannot absorb its
 clipped content within its bounds; that dropped content
 (Σ_i A_i·|residual_i|, A_i = `mesh.cell_area`) is written to
@@ -318,8 +360,12 @@ clipped content within its bounds; that dropped content
 function fct_advect_tracer!(C::LayeredCellField, h_old::LayeredCellField,
                             h_new::LayeredCellField, u::LayeredEdgeField,
                             Δt::Real; R::Real = _default_R(),
-                            clip_residual::Union{Nothing, Ref{Float64}} = nothing)
+                            clip_residual::Union{Nothing, Ref{Float64}} = nothing,
+                            vertical_order::Integer = 1)
     K = nlayers(C)
+    vertical_order in (1, 2) ||
+        throw(ArgumentError("fct_advect_tracer!: vertical_order must be " *
+                            "1 or 2, got $vertical_order"))
     nlayers(h_old) == nlayers(h_new) == K == nlayers(u) ||
         throw(ArgumentError("fct_advect_tracer!: layer counts differ"))
     Δt > 0 || throw(ArgumentError("fct_advect_tracer!: Δt must be positive"))
@@ -382,12 +428,21 @@ function fct_advect_tracer!(C::LayeredCellField, h_old::LayeredCellField,
     for i in 1:n
         Q[1][i] += Δt * w[1][i] * Chor[1][i]
     end
-    # interior interfaces: ONE upwind flux per interface, subtracted
-    # from the layer it leaves and added to the one it enters — column
+    # interior interfaces: ONE flux per interface (upwind, or the
+    # limited PLM donor value for vertical_order = 2), subtracted from
+    # the layer it leaves and added to the one it enters — column
     # content is conserved to round-off
     for k in 2:K, i in 1:n
         wk = w[k][i]
-        G = Δt * wk * (wk > 0 ? Chor[k - 1][i] : Chor[k][i])
+        d = wk > 0 ? k - 1 : k                      # donor layer
+        Cf = Chor[d][i]
+        if vertical_order == 2 && wk != 0
+            up = d > 1 ? Chor[d][i] - Chor[d - 1][i] : 0.0
+            dn = d < K ? Chor[d + 1][i] - Chor[d][i] : 0.0
+            c = min(1.0, abs(wk) * Δt / max(hhor[d][i], h_neglect, eps()))
+            Cf += (wk > 0 ? 0.5 : -0.5) * _mc(up, dn) * (1 - c)
+        end
+        G = Δt * wk * Cf
         Q[k - 1][i] -= G
         Q[k][i] += G
     end
