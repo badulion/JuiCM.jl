@@ -116,20 +116,43 @@ using Test
         @test maximum(abs(st.u[k][e]) for k in 1:6, e in 1:m.n_edges) > 1e-2
     end
 
+    @testset "momentum remap: any interface displacement (overlap form)" begin
+        # thin layers + a large vertical excursion: target interfaces
+        # displaced by up to ~3 source layers. The swept-flux form of #62
+        # (one flux per interface) is only valid for |d| ≤ ĥ_donor; the
+        # overlap remap must stay conservative and bounded for any d.
+        m = generate_icosahedral_mesh(n_subdivisions = 2)
+        Kc = 12
+        hsrc = LayeredCellField((i, k) -> k <= 6 ? 2.0 : 30.0, m, Kc)
+        hdst = LayeredCellField((i, k) -> 16.0, m, Kc)   # same total 192
+        rng = MersenneTwister(62)
+        u = LayeredEdgeField((e, k) -> randn(rng), m, Kc)
+        hmean(h, k, e) = 0.5 * (h[k][m.edge_cells[1, e]] + h[k][m.edge_cells[2, e]])
+        mom0 = [sum(hmean(hsrc, k, e) * u[k][e] for k in 1:Kc) for e in 1:m.n_edges]
+        lo0 = [minimum(u[k][e] for k in 1:Kc) for e in 1:m.n_edges]
+        hi0 = [maximum(u[k][e] for k in 1:Kc) for e in 1:m.n_edges]
+        JuiCM.Ocean._remap_edge_columns!(u, hsrc, hdst)
+        mom1 = [sum(hmean(hdst, k, e) * u[k][e] for k in 1:Kc) for e in 1:m.n_edges]
+        @test maximum(abs.(mom1 .- mom0)) < 1e-11 * 192
+        @test all(lo0[e] - 1e-12 <= u[k][e] <= hi0[e] + 1e-12
+                  for k in 1:Kc, e in 1:m.n_edges)
+    end
+
     # ------------------------------------------------------- rung V3
     @testset "V3: lock-exchange front Froude number (Shin et al. 2004)" begin
         # Configuration (scale-free problem: only F = U/√(g′H) matters):
         # closed channel 60 × 24 mean cell spacings on the
         # n_subdivisions = 5 mesh (d̄_e ≈ 240 km), full-depth lock at the
         # west end (15 % of the length), H = 200 m, g′ = 0.5 m/s²
-        # (c0 = √(g′H) = 10 m/s), 20 z* layers, no rotation, shock-
+        # (c0 = √(g′H) = 10 m/s), 40 z* layers, no rotation, shock-
         # sensor viscosity cap ν_h = 4.8e5 m²/s (grid Reynolds number
         # U·dx/ν = 2.5 with U = c0/2 — the Ilıcak et al. 2012 / MPAS-O
         # lock-exchange setting). Measured sensitivity (docs/ and the
-        # PR record): F rises with channel width and layer count and is
+        # PR record): F rises with layer count (10/20/40/60 →
+        # 0.43/0.48/0.494/0.498 on the 10 % contour at this width) and is
         # converged in dx and Δt.
         m = generate_icosahedral_mesh(n_subdivisions = 5, lloyd_iterations = 2)
-        H, K, gp = 200.0, 20, 0.5
+        H, K, gp = 200.0, 40, 0.5
         grid = VerticalGrid(H, K)
         ch = walled_channel(m; n_long = 60, n_wide = 24)
         st, λg = walled_lock_state(m, grid, eos, ch; g_prime = gp,
@@ -169,6 +192,11 @@ using Test
         for F in Fs
             @test (1 - tol) * Fref_lo <= F <= (1 + tol) * Fref_hi
         end
+        # the front speed itself: Benjamin's (1968) energy-conserving
+        # value F = 0.5 for the full-depth lock, to within 5 % on the
+        # nose contours (stricter than the ratified 10 % band above)
+        @test abs(Fs[1] / 0.5 - 1) < 0.05
+        @test abs(Fs[2] / 0.5 - 1) < 0.05
         # a sharp front: the contours move together (a wedge-shaped,
         # smeared current gives a slow 25 % contour)
         @test maximum(Fs) - minimum(Fs) < 0.03

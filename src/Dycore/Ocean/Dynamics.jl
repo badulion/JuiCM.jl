@@ -633,24 +633,25 @@ target ones ĥ^d_k (edge means of `hdst`, the z* layers). The two
 columns must have the same total (it is enforced to round-off: the
 bottom target interface is set to the source one).
 
-Flux form, with interface depths z_k measured downward from the
-surface (z_1 = 0, z_{k+1} = z_k + ĥ_k): interior interface k moves by
-d_k = z^d_k − z^s_k, and the swept volume d_k carries the DONOR
-layer's MC-limited piecewise-linear face value with the van Leer
-Courant correction (donor m = k if d_k > 0, else k − 1):
+Exact overlap remap ([`_overlap_remap!`](@ref)), with interface depths
+z_k measured downward from the surface (z_1 = 0, z_{k+1} = z_k + ĥ_k):
+each source layer m carries the MC-limited piecewise-linear profile
 
-    s_m  = MC(u_m − u_{m−1}, u_{m+1} − u_m)
-    u_f  = u_m ∓ ½ s_m (1 − |d_k|/ĥ^s_m)         (− if d_k > 0)
-    ĥ^d_k u_k ← ĥ^s_k u_k + d_{k+1} u_f,{k+1} − d_k u_f,k
+    u(ξ) = u_m + s_m (ξ − ½),  ξ ∈ [0, 1] across the layer,
+    s_m  = MC(u_m − u_{m−1}, u_{m+1} − u_m)   (s = 0 in the top and
+                                               bottom layers)
 
-(MC = monotonized-central limiter, `TracerFCT._mc`; van Leer 1977).
-Each interface transfer is one number seen by both layers, so the
-column momentum Σ_k ĥ_k u_k is conserved exactly (round-off). The
-face value lies between the donor's and the receiver's velocities, so
-for |d_k| ≤ ĥ^s_m (the per-step interface excursion of the z* regrid
-is a small fraction of a layer) the remap creates no new extrema. This
-is the piecewise-linear member of the limited remap family used by
-MOM6's ALE (White & Adcroft 2008) and MPAS-O's z* vertical transport.
+(MC = monotonized-central limiter, `TracerFCT._mc`; van Leer 1977), and
+each target layer receives the exact integral of that profile over its
+overlap with every source layer. The source integrals partition the
+column, so Σ_k ĥ_k u_k is conserved exactly (round-off), and every
+reconstructed value lies between neighbouring layer means, so the
+remap creates no new extrema — for ANY interface displacement. (The
+#62 flux form, one swept-volume flux per interface, was valid only for
+|d_k| ≤ ĥ_donor; with thin layers (60 z* levels, 3.3 m) the lock-
+exchange interface swept more than a layer per step and the momentum
+remap went unstable: measured NaN at day 6.) This is the piecewise-
+linear member of the remap family of MOM6's ALE (White & Adcroft 2008).
 
 Per-edge scalar loop through `Field[i]` getindex (AGENTS.md rule 3).
 """
@@ -661,6 +662,7 @@ function _remap_edge_columns!(u::LayeredEdgeField, hsrc::LayeredCellField,
         throw(ArgumentError("_remap_edge_columns!: layer counts differ"))
     mesh = mesh_of(u)
     zs = zeros(K + 1); zd = zeros(K + 1); uc = zeros(K); q = zeros(K)
+    sl = zeros(K)
     for e in 1:mesh.n_edges
         i, j = mesh.edge_cells[1, e], mesh.edge_cells[2, e]
         for k in 1:K
@@ -670,24 +672,50 @@ function _remap_edge_columns!(u::LayeredEdgeField, hsrc::LayeredCellField,
             q[k] = (zs[k + 1] - zs[k]) * uc[k]
         end
         zd[K + 1] = zs[K + 1]                 # identical totals (round-off)
-        for k in 2:K
-            d = zd[k] - zs[k]                 # > 0: source k → target k−1
-            d == 0 && continue
-            m = d > 0 ? k : k - 1             # donor layer
-            hm = zs[m + 1] - zs[m]
-            up = m > 1 ? uc[m] - uc[m - 1] : 0.0
-            dn = m < K ? uc[m + 1] - uc[m] : 0.0
-            c = hm > 0 ? min(1.0, abs(d) / hm) : 1.0
-            uf = uc[m] + (d > 0 ? -0.5 : 0.5) * _mc(up, dn) * (1 - c)
-            q[k - 1] += d * uf
-            q[k] -= d * uf
-        end
+        _overlap_remap!(q, zs, uc, zd, sl)
         for k in 1:K
             hk = zd[k + 1] - zd[k]
             u[k][e] = hk > 0 ? q[k] / hk : uc[k]
         end
     end
     return u
+end
+
+"""
+    _overlap_remap!(q, zs, c, zd, sl) -> q
+
+Conservative overlap remap of one column: source layer means `c` on the
+interfaces `zs` (length K+1, non-decreasing, downward) to the target
+interfaces `zd` (same end points). Writes the target layer CONTENTS
+(∫ c dz) into `q`; `sl` is a length-K slope scratch. Piecewise-linear
+MC-limited reconstruction, zero slope in the end layers (see
+[`_remap_edge_columns!`](@ref)).
+"""
+function _overlap_remap!(q, zs, c, zd, sl)
+    K = length(c)
+    for m in 1:K
+        sl[m] = (1 < m < K) ? _mc(c[m] - c[m - 1], c[m + 1] - c[m]) : 0.0
+    end
+    fill!(q, 0.0)
+    m = 1
+    for k in 1:K
+        a, b = zd[k], zd[k + 1]
+        b > a || continue
+        while m < K && zs[m + 1] <= a
+            m += 1
+        end
+        mm = m
+        while mm <= K && zs[mm] < b
+            lo = max(a, zs[mm]); hi = min(b, zs[mm + 1])
+            hm = zs[mm + 1] - zs[mm]
+            if hi > lo && hm > 0
+                ξ = ((lo + hi) / 2 - zs[mm]) / hm   # overlap midpoint
+                q[k] += (hi - lo) * (c[mm] + sl[mm] * (ξ - 0.5))
+            end
+            mm += 1
+        end
+    end
+    return q
 end
 
 # -------------------------------------------------------------- drivers
