@@ -647,4 +647,7 @@ using Random
     include("ocean_dynamics_test.jl")
     include("ocean_tracer_test.jl")
     include("ocean_tracer_fct_test.jl")
+    include("ocean_fct_guard_test.jl")
+    include("ocean_dynamics_fixes_test.jl")
+    include("gravity_current_benchmark_test.jl")
 end

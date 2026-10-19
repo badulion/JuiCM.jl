@@ -18,6 +18,7 @@ include("Dycore/Ocean/Tracers.jl")
 include("Dycore/Ocean/TracerFCT.jl")
 include("Dycore/Atmos/Dynamics.jl")
 include("Dycore/Ocean/Dynamics.jl")
+include("Benchmarks/Ocean/GravityCurrent.jl")
 
 using .Voronoi: VoronoiSphereMesh, generate_icosahedral_mesh,
                 mesh_summary, adjacency_consistent, kite_uniformity
@@ -25,8 +26,8 @@ using .Fields: Field, CellField, EdgeField, VertexField
 using .Layered: LayeredField, LayeredCellField, LayeredEdgeField, nlayers
 using .Vertical: VerticalGrid, zstar_thicknesses
 using .TRiSK: divergence, gradient, curl, tangential_flux, edge_mean,
-              kinetic_energy, pv_flux, relative_vorticity, divergence!,
-              cell_gradient
+              laplacian, kinetic_energy, pv_flux, relative_vorticity,
+              divergence!, cell_gradient
 using .Halo: MeshPartition, partition_mesh, n_regions, region_of,
              owned_indices, HaloInfo, build_halo_info, HaloArray,
              halo_array, HaloWorld, halo_world, halo_update!,
@@ -55,6 +56,10 @@ using .Atmos: SWState, sw_step!
 using .Ocean: OceanState, ocean_state, ocean_tendency!, ocean_step!,
               ocean_integrate!, ocean_volume, ocean_kinetic_energy,
               ocean_ssh
+using .GravityCurrent: lock_exchange_state, lock_channel_state,
+                       dense_fraction_profile, front_position, front_speed,
+                       buoyancy_content, interface_monotone, lock_channel_T,
+                       gravity_current_benchmark!
 
 export VoronoiSphereMesh, generate_icosahedral_mesh, Field,
        CellField, EdgeField, VertexField,
@@ -77,6 +82,9 @@ export VoronoiSphereMesh, generate_icosahedral_mesh, Field,
        fct_advect_tracer!,
        OceanState, ocean_state, ocean_tendency!, ocean_step!,
        ocean_integrate!, ocean_volume, ocean_kinetic_energy, ocean_ssh,
+       lock_exchange_state, lock_channel_state, front_position, front_speed,
+       buoyancy_content, interface_monotone, lock_channel_T,
+       dense_fraction_profile, gravity_current_benchmark!, laplacian,
        SWState, SWModel, sw_state, sw_model, AbstractPhysicsModule,
        compute_tendency!, NullForcing, sw_tendency!, sw_step!,
        sw_integrate!, sw_mass, sw_total_energy,
