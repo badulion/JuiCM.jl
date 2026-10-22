@@ -157,7 +157,7 @@ compute_tendency!(tend::SWState, state::SWState, ::NullForcing, t) = tend
 
 """
     sw_tendency!(out::SWState, state::SWState; physics = NullForcing(),
-                 topography = nothing, t = 0.0)
+                 topography = nothing, coriolis = nothing, t = 0.0)
         -> SWState
 
 Shallow-water dynamical tendency (R10 Eqs 16 and 20) plus the optional
@@ -181,6 +181,12 @@ fluid thickness `h` (standard vector-invariant SWE with bottom
 topography; R10 §2b). Williamson case 5 (zonal flow over an isolated
 mountain) requires this. With flat bottom the code path is unchanged.
 
+Coriolis (`coriolis::VertexField`, the Coriolis parameter f_v [1/s] at
+vertices; `nothing` = the rotating sphere, f_v = 2Ω z_v with the
+Williamson Ω): the ocean's fast mode passes its own f so the
+barotropic and baroclinic modes rotate identically (issue #45; e.g. an
+f-plane or a non-rotating benchmark).
+
 Sign note: `pv_flux` returns Q̂⊥ with the symmetric-q̃ form; R10 Eq 20's
 momentum term is −q̂F⊥ − ∇(gh+K), so the u-tendency uses
 `−Q̂⊥ − ∇(gh+K)`. Verified against the case-2 steady state (the #9
@@ -191,7 +197,7 @@ Requires all of `state`'s ghost slots to be current (call
 """
 function sw_tendency!(out::SWState, state::SWState;
                       physics::AbstractPhysicsModule = NullForcing(),
-                      topography = nothing,
+                      topography = nothing, coriolis = nothing,
                       t::Real = 0.0)
     mesh = mesh_of(state.h)
     (; R, Omega, g) = williamson_constants()
@@ -208,9 +214,9 @@ function sw_tendency!(out::SWState, state::SWState;
     scale!(out.h, -R)
 
     # momentum: ∂u*/∂t = −Q̂⊥ − ∇(g h*/R + K*)  →  ∂u/∂t = R · ∂u*/∂t
-    q = potential_vorticity(us, hs,
-                            VertexField(v -> 2 * Omega * mesh.vertex_xyz[3, v],
-                                        mesh))
+    fv = coriolis === nothing ?
+         VertexField(v -> 2 * Omega * mesh.vertex_xyz[3, v], mesh) : coriolis
+    q = potential_vorticity(us, hs, fv)
     Cor = pv_flux(q, Fu)                 # R10 Eq 49 (symmetric form)
     K = kinetic_energy(us)               # R10 Eq 63
     PhiK = lincomb!(similar_field(hs), g / R, hs, 1.0, K)   # [1/s²]

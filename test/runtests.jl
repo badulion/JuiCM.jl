@@ -654,4 +654,5 @@ using Random
     include("ocean_walled_channel_test.jl")
     include("ocean_coriolis_test.jl")
     include("ocean_bathymetry_test.jl")
+    include("ocean_barotropic_test.jl")
 end
