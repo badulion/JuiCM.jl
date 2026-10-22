@@ -472,9 +472,12 @@ function ocean_tendency!(out::OceanState, state::OceanState;
         axpy!(out.u[k], -g / R^2, bz)      # − b ∇z̄_k
         scale!(out.u[k], R)                # → [m/s²]
         # Coriolis/Bernoulli bracket [m/s²]: −Q̂⊥_k − ∇K*_k·R
+        # both terms are scaled-variable brackets [rad/s²] → ·R [m/s²]
+        # (as in sw_tendency!; issue #66: the PV flux was once left
+        # unscaled, i.e. 1/R too weak — no rotation, no ζ×u advection)
         copyto!(cors[k], Cor)
-        scale!(cors[k], -1.0)
-        axpy!(cors[k], -R, gradient(Kk))  # (gradient in bracket·R units)
+        scale!(cors[k], -R)
+        axpy!(cors[k], -R, gradient(Kk))
 
         # accumulate for the next layer: pacc += (ρ_k/ρ0) h_k  [m]
         # (pbar = g·pacc + (g/2)(ρ_k/ρ0) h_k assembles the pressure)

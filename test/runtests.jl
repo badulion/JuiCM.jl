@@ -652,4 +652,5 @@ using Random
     include("gravity_current_benchmark_test.jl")
     include("ocean_regrid_test.jl")
     include("ocean_walled_channel_test.jl")
+    include("ocean_coriolis_test.jl")
 end
