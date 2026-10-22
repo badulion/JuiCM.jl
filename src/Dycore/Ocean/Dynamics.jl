@@ -55,12 +55,14 @@
 # Mode split (user-ratified 2026-10-16; MPAS-O-style barotropic/
 # baroclinic split with a state-carried fast mode):
 #
-#   fast (barotropic): the 2D shallow-water system for (H0 + η, ū) —
-#     exactly the Phase-1 SW dycore (Coriolis included) — substepped
-#     n_sub times per slow step with Δt_fast ≈ Δt_slow / n_sub set by
-#     the barotropic CFL (√(g·H0)). The fast state (η, ū) is *carried
-#     in OceanState* (fields `eta`, `ubar`) — it is prognostic, not a
-#     per-step diagnostic.
+#   fast (barotropic): the 2D shallow-water system for (H + η, ū) —
+#     exactly the Phase-1 SW dycore, with the SAME Coriolis parameter
+#     as the slow layers (issue #69) — substepped with Δt_fast =
+#     Δt_slow / n_sub set by the barotropic CFL (√(g·H)) over the window
+#     [t, t + 2Δt_slow] and time-averaged with weights centred on
+#     t + Δt_slow (see "filtered" below). The fast state (η, ū) is
+#     *carried in OceanState* (fields `eta`, `ubar`) — it is
+#     prognostic, not a per-step diagnostic.
 #   slow (baroclinic): SSPRK(3,3) on the velocity *anomalies*
 #     u′ = u − ū over the full Δt_slow, with the baroclinic projection
 #     above removing the depth-mean force — the slow step is limited
@@ -87,7 +89,9 @@
 #   reference evaluation is the slow operator's own response to η, so
 #   G carries no surface-wave force). The fast state is carried as the
 #   time-filtered pair (η̄, ū̄) — both averaged with the same trapezoid
-#   weights — and the layers are re-projected after the step so that
+#   weights over [t, t + 2Δt], centred on t + Δt (issue #69: the
+#   pre-#69 window [t, t + Δt] was centred on t + Δt/2, so barotropic
+#   evolution ran at half speed) — and the layers are re-projected after the step so that
 #   their depth-mean velocity equals ū̄. Measured in the closed #40
 #   channel: the pressure-only projection left 3 m/s of momentum-
 #   without-mass depth-mean flow and a wedge-shaped dense current
@@ -102,17 +106,17 @@
 #   hexagon coastline is otherwise effectively no-slip), and wall cells
 #   average the kinetic energy over their open edges.
 #   coupling (step end): the depth-mean of the layers is REPLACED with
-#     the fast solver's ū_end (u_k = u′_k + ū_end; the slow system's
+#     the fast solver's filtered ū̄ (u_k = u′_k + ū̄; the slow system's
 #     barotropic velocity DOF is unphysical — its force was frozen —
 #     so it is discarded, not added to), the column is re-stretched to
-#     the coordinate map with the TIME-MEAN fast η over the substeps
+#     the coordinate map with the filtered fast η̄
 #     (η̄; the end-of-step η of a barotropic wave is a random-phase
 #     sample of a ~14 h oscillation — injecting it would alias the fast
 #     wave into the slow state; the substep mean is the physical
 #     volume change). Distribution of the column correction:
 #     proportional stretch for :zstar (fractions preserved), whole
 #     anomaly into the top layer for :simplez. (state.eta, state.ubar)
-#     are set to (η̄, ū_end). After the re-stretch Σ_k h_k − H0 = η̄
+#     are set to (η̄, ū̄). After the re-stretch Σ_k h_k − H = η̄
 #     holds exactly, and the total volume follows the fast solver's
 #     flux-form continuity (conserved to round-off; Phase-1 SW mass
 #     conservation).
@@ -211,7 +215,7 @@ import ..TimeStepping: _stage, _lincomb!, _axpy!
 
 export OceanState, ocean_state, ocean_tendency!, ocean_step!,
        ocean_integrate!, ocean_volume, ocean_kinetic_energy,
-       ocean_ssh, wall_vertices
+       ocean_ssh, wall_vertices, coriolis_parameter
 
 # ---------------------------------------------------------------- state
 
@@ -323,12 +327,31 @@ step end, keeping Σ_k h_k − H0 equal to `eta` exactly).
 """
 ocean_ssh(grid::VerticalGrid, s::OceanState) = s.eta
 
+# ------------------------------------------------------------ rotation
+
+"""
+    coriolis_parameter(mesh; Omega = nothing, f0 = nothing) -> VertexField
+
+Coriolis parameter f_v [1/s] at the vertices of `mesh`: the rotating
+sphere f_v = 2Ω z_v (`Omega` [1/s]; `nothing` = Earth's, from
+`williamson_constants`), or the constant `f0` everywhere when given
+(f-plane; overrides `Omega`). Used by both the slow tendency and the
+fast barotropic mode of [`ocean_step!`](@ref), so the two modes always
+rotate identically.
+"""
+function coriolis_parameter(mesh; Omega = nothing, f0 = nothing)
+    f0 !== nothing && return VertexField(v -> Float64(f0), mesh)
+    Ω = Omega === nothing ? williamson_constants().Omega : Omega
+    return VertexField(v -> 2 * Ω * mesh.vertex_xyz[3, v], mesh)
+end
+
 # ------------------------------------------------------------ tendency
 
 """
     ocean_tendency!(out::OceanState, state::OceanState; grid, eos,
                     eta = nothing, bathymetry = nothing, Omega = nothing,
-                    nu_h = 0.0, c_drag = 0.0, advect_tracers = true,
+                    f0 = nothing, nu_h = 0.0, c_drag = 0.0,
+                    advect_tracers = true,
                     free_slip_vertices = nothing, ke_closed_edges = nothing,
                     depth_mean_out = nothing, projection = :pressure)
         -> OceanState
@@ -345,6 +368,11 @@ heights; `nothing` = the state-consistent diagnostic (Σ h_k − H,
 identical at every stage of a split step by the column invariant).
 `bathymetry` is the depth H [m] used by that diagnostic: a `CellField`
 (issue #65) or `nothing` for the flat `grid.H0`.
+
+Rotation: the Coriolis parameter is f_v = 2Ω z_v at vertices (`Omega`
+[1/s]; `nothing` = Earth's), or the constant `f0` [1/s] everywhere
+when given — the f-plane of laboratory rotating-tank benchmarks (issue
+#45). `f0` overrides `Omega`.
 
 After this call `out` holds the physical-unit tendencies of
 (u, h, T, S). With `advect_tracers = true` (default; the #32
@@ -392,7 +420,7 @@ run (single-region in #30; the partitioned driver lands with #45).
 function ocean_tendency!(out::OceanState, state::OceanState;
                          grid::VerticalGrid, eos::AbstractOceanEOS,
                          eta = nothing, bathymetry = nothing,
-                         Omega = nothing, nu_h::Real = 0.0,
+                         Omega = nothing, f0 = nothing, nu_h::Real = 0.0,
                          c_drag::Real = 0.0, advect_tracers::Bool = true,
                          free_slip_vertices = nothing, ke_closed_edges = nothing,
                          depth_mean_out = nothing, projection::Symbol = :pressure)
@@ -400,7 +428,7 @@ function ocean_tendency!(out::OceanState, state::OceanState;
     projection in (:pressure, :full) ||
         throw(ArgumentError("ocean_tendency!: projection must be :pressure or :full"))
     (; R, g) = williamson_constants()
-    Ω = Omega === nothing ? williamson_constants().Omega : Omega
+    fvert = coriolis_parameter(mesh; Omega = Omega, f0 = f0)
     K = nlayers(state.h)
 
     # density from the pluggable EOS (per-layer cell fields)
@@ -466,9 +494,7 @@ function ocean_tendency!(out::OceanState, state::OceanState;
 
         # --- momentum bracket [m/s²], pressure part only:
         #   −∇(p̄_k/ρ0)/R² − (g ρ_k/ρ0)·∇z̄_k/R²  (NO Cor/KE yet)
-        q = potential_vorticity(us[k], hs[k],
-                                VertexField(v -> 2 * Ω *
-                                                mesh.vertex_xyz[3, v], mesh);
+        q = potential_vorticity(us[k], hs[k], fvert;
                                 free_slip_vertices = free_slip_vertices)
         Cor = pv_flux(q, Fk)
         du = gradient(pbar)                # [m²/s²/rad]
@@ -787,23 +813,26 @@ end
                 nu_h = 0.0, c_drag = 0.0, min_h_frac = 0.0,
                 tracer_advection = :fct, floor_stats = nothing,
                 regrid = false, closed_edges = nothing,
-                bathymetry = nothing)
+                bathymetry = nothing, f0 = nothing)
         -> OceanState
 
 Advance one mode-split step of Δt [s] (single-region state):
 
 1. **fast**: the 2D SW system (H + η, ū) — from the carried
-   `state.eta`/`state.ubar` — substepped `n_sub` times (SSPRK(3,3) on
-   the Phase-1 `sw_tendency!`, identical to `sw_step!`, with bottom
-   topography b = −H when `bathymetry` is given; `n_sub = nothing`
-   picks the smallest count with Δt/n_sub within the barotropic CFL
-   limit `cfl·dx/√(g·max H)`, minimum 1),
+   `state.eta`/`state.ubar` — substepped with Δt/`n_sub` over the
+   window [t, t + 2Δt] (SSPRK(3,3) on the Phase-1 `sw_tendency!`,
+   identical to `sw_step!`, with bottom topography b = −H when
+   `bathymetry` is given and the slow mode's Coriolis parameter) and
+   time-averaged with trapezoid weights centred on t + Δt (MPAS-O
+   split-explicit filter, issue #69); `n_sub = nothing` picks the
+   smallest count with Δt/n_sub within the barotropic CFL limit
+   `cfl·dx/√(g·max H)`, minimum 1,
 2. **slow**: SSPRK(3,3) baroclinic step on the velocity anomalies
    u′ = u − ū ([`ocean_tendency!`](@ref), anomaly continuity fluxes)
    over Δt,
 3. **coupling**: add the fast solver's ū_end to the layers
    (`u_k = u′_k + ū_end`), re-stretch the column to the coordinate map
-   with the time-mean fast η, and store (η̄, ū_end) back into the state
+   with the filtered fast η̄, and store (η̄, ū̄) back into the state
    (see module header),
 4. **tracers** (`tracer_advection`): `:fct` (default, issue #40) —
    operator-split FCT step ([`fct_advect_tracer!`](@ref)) driven by the
@@ -855,6 +884,11 @@ Keywords:
   Tangential (vorticity) terms see u = 0 on the wall — the TRiSK
   free-slip wall of Ringler et al. (2010) §6 class. The input state
   must already have u = ū = 0 on closed edges.
+- `Omega`, `f0` — rotation ([`coriolis_parameter`](@ref)): f = 2Ω sin φ
+  (`Omega = nothing`: Earth's), or the constant `f0` [1/s] (f-plane,
+  issue #45; overrides `Omega`). The fast barotropic mode uses the
+  SAME f as the slow layers (before #45 it always rotated with Earth's
+  Ω, whatever `Omega` was).
 - `bathymetry` — `nothing` (default: flat bottom at `grid.H0`) or a
   `CellField` of positive depths H [m] (issue #65, DESIGN.md D7; e.g.
   the #49 `bathymetry_*` profiles). The bottom sits at z = −H(x, y):
@@ -880,9 +914,11 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
                      nu_h::Real = 0.0, min_h_frac::Real = 0.0,
                      c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
                      floor_stats = nothing, regrid::Bool = false,
-                     closed_edges = nothing, bathymetry = nothing)
+                     closed_edges = nothing, bathymetry = nothing,
+                     f0 = nothing)
     mesh = mesh_of(state.h)
     (; R, g) = williamson_constants()
+    fvert = coriolis_parameter(mesh; Omega = Omega, f0 = f0)
     H0 = grid.H0
     K = nlayers(state.h)
     (bathymetry !== nothing && grid.mode === :simplez) &&
@@ -930,21 +966,32 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         dt_max = cfl * R * dx / c          # [s]
         n_sub = max(1, ceil(Int, Δt / dt_max))
     end
+    n_sub += isodd(n_sub)                  # even: the window edges t ± Δt/2 are substep ends
     Δtf = Δt / n_sub
     fast = SWState(h2, ubar0)
-    # time-mean fast η over the substeps (trapezoid across substep
-    # ends): the end-of-step η of a barotropic wave is a random-phase
-    # sample of a 2π/ω_bt ≈ 14 h oscillation — injecting it into the
-    # layers via the re-stretch aliases the fast wave into the slow
-    # state. The substep mean converges to the step-mean η (the
-    # physically meaningful volume change); the oscillation averages
-    # out. Includes both endpoints: η̄ = (η_0/2 + Σ_{n=1..n_sub−1} η_n +
-    # η_end/2)/n_sub.
+    # Filtered fast state (issue #69; the MPAS-O split-explicit filter
+    # class, Ringler et al. 2013 §3c, Higdon 2005): the fast mode is
+    # subcycled from t to t + 3Δt/2 (3n/2 substeps of Δtf = Δt/n, n =
+    # n_sub even) and the new state is the trapezoid time-mean over the
+    # averaging window [t + Δt/2, t + 3Δt/2] (substeps j0 = n/2 … j1 =
+    # 3n/2),
+    #   η̄ = (η_j0/2 + Σ_{j0<j<j1} η_j + η_j1/2)/n,  ū̄ likewise,
+    # centred on t + Δt — the time it is stored at. The mean filters the
+    # barotropic waves (an end-of-window sample is a random phase of a
+    # ~14 h oscillation; injecting it through the re-stretch aliases the
+    # fast wave into the slow state) while slow barotropic evolution
+    # advances by a full Δt; a slow oscillation of frequency ω is damped
+    # by the window width Δt only, by ≈ (ωΔt)²/24 per step. (Before #69
+    # the window was [t, t + Δt], centred on t + Δt/2: every barotropic
+    # process ran at HALF speed — measured: a passive tracer in a steady
+    # barotropic flow moved at 0.497 U, a barotropic inertial
+    # oscillation turned at ≈ f/2.)
     #
     # Barotropic transport consistent with η̄ (tracer budget, :fct):
-    # η_n − η_0 = −(Δtf/R) ∇·Σ_{m≤n} F_m with F_m the b-weighted SSPRK
-    # flux ĥū of substep m, so
-    #   η̄ − η_0 = −(Δt/R) ∇·F̄_bt,  F̄_bt = Σ_m (n_sub − m + ½)/n_sub² F_m
+    # η_j − η_0 = −(Δtf/R) ∇·Σ_{m≤j} F_m with F_m the b-weighted SSPRK
+    # flux ĥū of substep m, so η̄ − η_0 = −(Δt/R) ∇·F̄_bt with the
+    # normalised (weights sum to 1) mean transport
+    #   F̄_bt = Σ_{m ≤ j0} F_m/n + Σ_{j0 < m ≤ j1} (j1 − m + ½)/n² F_m
     # — exactly the column volume change the re-stretch imposes.
     Fbt = fill!(similar_field(ubar0), 0.0)        # [m²/s]
     wsub = Ref(0.0)
@@ -974,7 +1021,8 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         end
         tend0 = copy(start)
         ocean_tendency!(tend0, start; grid = grid, eos = eos, eta = eta0,
-                        Omega = Omega, nu_h = nu_h, c_drag = c_drag,
+                        Omega = Omega, f0 = f0, nu_h = nu_h,
+                        c_drag = c_drag,
                         advect_tracers = false, free_slip_vertices = wallv,
                         ke_closed_edges = closed_edges, depth_mean_out = G,
                         projection = :full)
@@ -990,7 +1038,8 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         end
         Gref = similar_field(ubar0)
         ocean_tendency!(copy(ref), ref; grid = grid, eos = eos, eta = eta0,
-                        Omega = Omega, nu_h = nu_h, c_drag = c_drag,
+                        Omega = Omega, f0 = f0, nu_h = nu_h,
+                        c_drag = c_drag,
                         advect_tracers = false, free_slip_vertices = wallv,
                         ke_closed_edges = closed_edges, depth_mean_out = Gref,
                         projection = :full)
@@ -999,7 +1048,8 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     end
 
     function Lfast(out, s, τ)
-        sw_tendency!(out, s; topography = topo)   # == sw_step!'s L
+        sw_tendency!(out, s; topography = topo,   # == sw_step!'s L
+                     coriolis = fvert)
         axpy!(out.u, 1.0, G)               # baroclinic → barotropic forcing
         _close_edges!(out.u, closed_edges)
         if use_fct
@@ -1008,27 +1058,28 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         end
         return out
     end
-    eta_mean = lincomb!(similar_field(eta0), 0.5, Hcol, 0.5, eta0)
-    ubar_mean = lincomb!(similar_field(ubar0), 0.5, ubar0, 0.0, ubar0)
-    for n in 1:n_sub
-        wsub[] = (n_sub - n + 0.5) / n_sub^2
+    j0 = n_sub ÷ 2                         # window start t + Δt/2
+    j1 = 3 * n_sub ÷ 2                     # window end t + 3Δt/2
+    eta_mean = fill!(similar_field(eta0), 0.0)
+    ubar_mean = fill!(similar_field(ubar0), 0.0)
+    for n in 1:j1
+        wsub[] = n <= j0 ? 1.0 / n_sub : (j1 - n + 0.5) / n_sub^2
         fast = ssprk3_step!(Lfast, fast, t + (n - 1) * Δtf, Δtf)
-        if n < n_sub
-            axpy!(eta_mean, 1.0, fast.h)   # accumulate H + η_n
-            axpy!(ubar_mean, 1.0, fast.u)
+        if n >= j0                         # trapezoid weights ½, 1, …, 1, ½
+            wj = (n == j0 || n == j1) ? 0.5 : 1.0
+            axpy!(eta_mean, wj, fast.h)    # accumulate H + η_n
+            axpy!(ubar_mean, wj, fast.u)
         end
     end
-    axpy!(eta_mean, 0.5, fast.h)           # + η_end/2 (trapezoid close)
-    scale!(eta_mean, 1.0 / n_sub)          # [m]: time-mean (H + η)
-    axpy!(ubar_mean, 0.5, fast.u)
-    scale!(ubar_mean, 1.0 / n_sub)         # time-mean ū (same weights)
+    scale!(eta_mean, 1.0 / n_sub)          # [m]: filtered (H + η) at t + Δt
+    scale!(ubar_mean, 1.0 / n_sub)         # filtered ū (same weights)
     eta1 = lincomb!(similar_field(eta0), 1.0, eta_mean,
                     -1.0, Hcol)                            # η̄ = mean − H
     # time-mean ū with the SAME trapezoid weights as η̄: the fast state
-    # is carried as the filtered pair (η̄, ū̄) — MPAS-O split-explicit
-    # (Ringler et al. 2013 §3c) restarts the barotropic subcycle from the
-    # time-averaged state. Pairing the filtered η̄ with the instantaneous
-    # end-of-step ū (the pre-#40 form) is an amplifying restart for
+    # is carried as the filtered pair (η̄, ū̄) at t + Δt — MPAS-O
+    # split-explicit restarts the barotropic subcycle from the time-
+    # averaged state. Pairing the filtered η̄ with the instantaneous
+    # end-of-window ū (the pre-#40 form) is an amplifying restart for
     # barotropic waves once they are forced (measured with the
     # barotropic forcing G: exponential blow-up ×6 per 6 h).
     ubar1 = ubar_mean
@@ -1044,7 +1095,8 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     sstage = Ref(0)
     function L(out, s, τ)
         ocean_tendency!(out, s; grid = grid, eos = eos, eta = eta0,
-                        Omega = Omega, nu_h = nu_h, c_drag = c_drag,
+                        Omega = Omega, f0 = f0, nu_h = nu_h,
+                        c_drag = c_drag,
                         advect_tracers = !use_fct,
                         free_slip_vertices = wallv,
                         ke_closed_edges = closed_edges, projection = :full)
@@ -1332,7 +1384,7 @@ end
                      min_h_frac = 0.0, c_drag = 0.0,
                      tracer_advection = :fct, floor_stats = nothing,
                      regrid = false, closed_edges = nothing,
-                     bathymetry = nothing)
+                     bathymetry = nothing, f0 = nothing)
         -> OceanState
 
 Integrate `n_steps` equal mode-split steps (see [`ocean_step!`](@ref)
@@ -1344,7 +1396,8 @@ function ocean_integrate!(state::OceanState, grid::VerticalGrid,
                           nu_h::Real = 0.0, min_h_frac::Real = 0.0,
                           c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
                           floor_stats = nothing, regrid::Bool = false,
-                          closed_edges = nothing, bathymetry = nothing)
+                          closed_edges = nothing, bathymetry = nothing,
+                          f0 = nothing)
     Δt = (t_final - t0) / n_steps
     for n in 1:n_steps
         state = ocean_step!(state, grid, eos, t0 + (n - 1) * Δt, Δt;
@@ -1353,7 +1406,7 @@ function ocean_integrate!(state::OceanState, grid::VerticalGrid,
                             tracer_advection = tracer_advection,
                             floor_stats = floor_stats, regrid = regrid,
                             closed_edges = closed_edges,
-                            bathymetry = bathymetry)
+                            bathymetry = bathymetry, f0 = f0)
     end
     return state
 end

@@ -55,7 +55,7 @@ using .TracerFCT: fct_advect_tracer!
 using .Atmos: SWState, sw_step!
 using .Ocean: OceanState, ocean_state, ocean_tendency!, ocean_step!,
               ocean_integrate!, ocean_volume, ocean_kinetic_energy,
-              ocean_ssh, wall_vertices
+              ocean_ssh, wall_vertices, coriolis_parameter
 using .GravityCurrent: lock_exchange_state, lock_channel_state,
                        dense_fraction_profile, front_position, front_speed,
                        buoyancy_content, interface_monotone, lock_channel_T,
@@ -84,7 +84,7 @@ export VoronoiSphereMesh, generate_icosahedral_mesh, Field,
        fct_advect_tracer!,
        OceanState, ocean_state, ocean_tendency!, ocean_step!,
        ocean_integrate!, ocean_volume, ocean_kinetic_energy, ocean_ssh,
-       wall_vertices, walled_channel, walled_lock_state,
+       wall_vertices, coriolis_parameter, walled_channel, walled_lock_state,
        walled_front_position, walled_lock_exchange!,
        lock_exchange_state, lock_channel_state, front_position, front_speed,
        buoyancy_content, interface_monotone, lock_channel_T,
