@@ -6,9 +6,10 @@
 # Ringler, Petersen, Jacobsen & Jones 2013 — the MPAS-Ocean framework —
 # for the layered/mode-split aspects).
 #
-# Equation set (per layer k = 1 top, flat bottom, z* or simple-z from
-# the VerticalGrid mode; h_k = layer thickness, u_k = layer normal
-# velocity, ρ_k = layer density from the pluggable EOS):
+# Equation set (per layer k = 1 top, bottom at z = −H — flat H0 or the
+# `bathymetry` field of issue #65 — z* or simple-z from the VerticalGrid
+# mode; h_k = layer thickness, u_k = layer normal velocity, ρ_k = layer
+# density from the pluggable EOS):
 #
 #   ∂h_k/∂t = −∇·(h_k u_k)                       (layer continuity)
 #   ∂u_k/∂t = −q̂_k F⊥_k − ∇(p̄_k/ρ0 + K_k)
@@ -326,8 +327,8 @@ ocean_ssh(grid::VerticalGrid, s::OceanState) = s.eta
 
 """
     ocean_tendency!(out::OceanState, state::OceanState; grid, eos,
-                    eta = nothing, Omega = nothing, nu_h = 0.0,
-                    c_drag = 0.0, advect_tracers = true,
+                    eta = nothing, bathymetry = nothing, Omega = nothing,
+                    nu_h = 0.0, c_drag = 0.0, advect_tracers = true,
                     free_slip_vertices = nothing, ke_closed_edges = nothing,
                     depth_mean_out = nothing, projection = :pressure)
         -> OceanState
@@ -340,8 +341,10 @@ fluxes, so the column sum Σ_k h_k is an exact invariant of the slow
 step, and the thickness-weighted depth-mean of the pressure force is
 removed from the momentum (the baroclinic projection; see module
 header). `eta` overrides the free surface used in the interface
-heights; `nothing` = the state-consistent diagnostic (Σ h_k − H0,
+heights; `nothing` = the state-consistent diagnostic (Σ h_k − H,
 identical at every stage of a split step by the column invariant).
+`bathymetry` is the depth H [m] used by that diagnostic: a `CellField`
+(issue #65) or `nothing` for the flat `grid.H0`.
 
 After this call `out` holds the physical-unit tendencies of
 (u, h, T, S). With `advect_tracers = true` (default; the #32
@@ -388,7 +391,8 @@ run (single-region in #30; the partitioned driver lands with #45).
 """
 function ocean_tendency!(out::OceanState, state::OceanState;
                          grid::VerticalGrid, eos::AbstractOceanEOS,
-                         eta = nothing, Omega = nothing, nu_h::Real = 0.0,
+                         eta = nothing, bathymetry = nothing,
+                         Omega = nothing, nu_h::Real = 0.0,
                          c_drag::Real = 0.0, advect_tracers::Bool = true,
                          free_slip_vertices = nothing, ke_closed_edges = nothing,
                          depth_mean_out = nothing, projection::Symbol = :pressure)
@@ -406,7 +410,9 @@ function ocean_tendency!(out::OceanState, state::OceanState;
     # fluxes use pure anomaly velocities, so Σ_k h_k (and hence η) is
     # EXACTLY invariant during the slow step — there is no barotropic
     # self-feedback (see the depth-mean projection below).
-    η = eta === nothing ? ssh_from_thickness(grid, state.h) : eta
+    η = eta !== nothing ? eta :
+        bathymetry === nothing ? ssh_from_thickness(grid, state.h) :
+        ssh_from_thickness(grid, state.h, bathymetry)
 
     # scaled per-layer velocities u* = u/R (anomalies during a split step)
     us = similar(state.u)
@@ -780,16 +786,18 @@ end
                 n_sub = nothing, cfl = 0.3, Omega = nothing,
                 nu_h = 0.0, c_drag = 0.0, min_h_frac = 0.0,
                 tracer_advection = :fct, floor_stats = nothing,
-                regrid = false, closed_edges = nothing)
+                regrid = false, closed_edges = nothing,
+                bathymetry = nothing)
         -> OceanState
 
 Advance one mode-split step of Δt [s] (single-region state):
 
-1. **fast**: the 2D SW system (H0 + η, ū) — from the carried
+1. **fast**: the 2D SW system (H + η, ū) — from the carried
    `state.eta`/`state.ubar` — substepped `n_sub` times (SSPRK(3,3) on
-   the Phase-1 `sw_tendency!`, identical to `sw_step!`; `n_sub =
-   nothing` picks the smallest count with Δt/n_sub within the
-   barotropic CFL limit `cfl·dx/√(g·H0)`, minimum 1),
+   the Phase-1 `sw_tendency!`, identical to `sw_step!`, with bottom
+   topography b = −H when `bathymetry` is given; `n_sub = nothing`
+   picks the smallest count with Δt/n_sub within the barotropic CFL
+   limit `cfl·dx/√(g·max H)`, minimum 1),
 2. **slow**: SSPRK(3,3) baroclinic step on the velocity anomalies
    u′ = u − ū ([`ocean_tendency!`](@ref), anomaly continuity fluxes)
    over Δt,
@@ -814,8 +822,9 @@ Keywords:
   ν_e = min(ν_h, dx_e³|∇²u′_e|) (see [`ocean_tendency!`](@ref); 0 = off).
 - `c_drag` [–] — collapsed-layer quadratic drag coefficient
   (see [`ocean_tendency!`](@ref); 0 = off).
-- `min_h_frac` [–] — minimum layer thickness as a fraction of
-  `grid.H0` (h_min = min_h_frac·H0), applied once per step after the
+- `min_h_frac` [–] — minimum layer thickness as a fraction of the
+  column depth (h_min = min_h_frac·H, per column with `bathymetry`,
+  min_h_frac·`grid.H0` without), applied once per step after the
   tracer step. **Opt-in** (default 0 = no floor). Must satisfy
   `min_h_frac·K < 1` (otherwise a resting column is entirely below the
   floor) — an `ArgumentError` is thrown.
@@ -824,7 +833,7 @@ Keywords:
   [`_apply_thickness_floor!`](@ref)).
 - `regrid` — z* vertical coordinate (issue #62, DESIGN.md D7). `true`:
   after the re-stretch the layers are restored to the z* target
-  `layer_thickness(grid, η̄)` (h_k = Δf_k·(H0 + η̄)) every step — the
+  `layer_thickness(grid, η̄, H)` (h_k = Δf_k·(H + η̄)) every step — the
   vertical ALE remap of MPAS-O/MOM6. u is remapped per edge column by
   [`_remap_edge_columns!`](@ref) (Σ_k ĥ_k u_k exact, MC-limited, no new
   extrema), T/S by the FCT step with h_new = target and the limited
@@ -846,8 +855,21 @@ Keywords:
   Tangential (vorticity) terms see u = 0 on the wall — the TRiSK
   free-slip wall of Ringler et al. (2010) §6 class. The input state
   must already have u = ū = 0 on closed edges.
+- `bathymetry` — `nothing` (default: flat bottom at `grid.H0`) or a
+  `CellField` of positive depths H [m] (issue #65, DESIGN.md D7; e.g.
+  the #49 `bathymetry_*` profiles). The bottom sits at z = −H(x, y):
+  the fast mode carries H + η over topography b = −H, and the
+  re-stretch, the z* regrid target and the thickness floor use the
+  per-column H (z* layers h_k = Δf_k·(H + η) follow the terrain). The
+  slow PGF needs no change: its interface heights come from the actual
+  column (z_1 = η, z_{k+1} = z_k − h_k), so the bottom interface is −H
+  automatically and a resting uniform-density ocean over any H feels
+  exactly −g∇η = 0. Requires the z* coordinate (`:simplez` levels are
+  fixed fractions of a flat H0 — `ArgumentError` otherwise). The input
+  state must be column-consistent with it (Σ_k h_k − H = η, e.g.
+  `layer_thickness(grid, η, H)`).
 
-Requires a column-consistent input state (Σ_k h_k − H0 = η, which
+Requires a column-consistent input state (Σ_k h_k − H = η, which
 every `ocean_step!` output satisfies) for the `:fct` budget to be
 exact. Split scheme documented in the module header (Lie splitting,
 MPAS-O-flavored barotropic/baroclinic split).
@@ -858,11 +880,24 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
                      nu_h::Real = 0.0, min_h_frac::Real = 0.0,
                      c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
                      floor_stats = nothing, regrid::Bool = false,
-                     closed_edges = nothing)
+                     closed_edges = nothing, bathymetry = nothing)
     mesh = mesh_of(state.h)
     (; R, g) = williamson_constants()
     H0 = grid.H0
     K = nlayers(state.h)
+    (bathymetry !== nothing && grid.mode === :simplez) &&
+        throw(ArgumentError("ocean_step!: variable bathymetry requires the " *
+                            "z* coordinate (:simplez levels are fixed " *
+                            "fractions of a flat H0)"))
+    # column depth H [m] as a cell field (flat H0 without bathymetry) and
+    # the fast-mode bottom topography b = −H (nothing for the flat
+    # bottom: the Phase-1 code path, ∇b ≡ 0)
+    Hcol = bathymetry === nothing ? fill!(similar_field(state.eta), H0) :
+           bathymetry
+    topo = bathymetry === nothing ? nothing :
+           scale!(copyto!(similar_field(state.eta), bathymetry), -1.0)
+    Hmax = bathymetry === nothing ? H0 : maximum(bathymetry[i] for i in
+                                                 eachindex(bathymetry))
     tracer_advection in (:fct, :upwind) ||
         throw(ArgumentError("ocean_step!: tracer_advection must be " *
                             ":fct or :upwind, got $tracer_advection"))
@@ -883,16 +918,15 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     # b-weighted stage fluxes are the time-integrated mass flux.
     ssprk_b = (1 / 6, 1 / 6, 2 / 3)
 
-    # --- fast mode: 2D SW system (H0 + η, ū) from the carried state ---
+    # --- fast mode: 2D SW system (H + η, ū) from the carried state ---
     eta0 = state.eta
     ubar0 = state.ubar
-    h2 = lincomb!(similar_field(eta0), 1.0,
-                  fill!(similar_field(eta0), H0), 1.0, eta0)   # H0 + η
-    # substep count from the barotropic CFL: wave speed √(g·H0) [m/s],
+    h2 = lincomb!(similar_field(eta0), 1.0, Hcol, 1.0, eta0)   # H + η
+    # substep count from the barotropic CFL: wave speed √(g·max H) [m/s],
     # dx = min cell-center distance [rad] → physical dx = R·dx
     if n_sub === nothing
         dx = minimum(mesh.d_e)             # cell-center distances [rad]
-        c = sqrt(g * H0)                   # [m/s]
+        c = sqrt(g * Hmax)                 # [m/s]
         dt_max = cfl * R * dx / c          # [s]
         n_sub = max(1, ceil(Int, Δt / dt_max))
     end
@@ -965,7 +999,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     end
 
     function Lfast(out, s, τ)
-        sw_tendency!(out, s)               # == sw_step!'s L (no physics)
+        sw_tendency!(out, s; topography = topo)   # == sw_step!'s L
         axpy!(out.u, 1.0, G)               # baroclinic → barotropic forcing
         _close_edges!(out.u, closed_edges)
         if use_fct
@@ -974,23 +1008,22 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         end
         return out
     end
-    eta_mean = lincomb!(similar_field(eta0), 1.0,
-                        fill!(similar_field(eta0), H0 / 2), 0.5, eta0)
+    eta_mean = lincomb!(similar_field(eta0), 0.5, Hcol, 0.5, eta0)
     ubar_mean = lincomb!(similar_field(ubar0), 0.5, ubar0, 0.0, ubar0)
     for n in 1:n_sub
         wsub[] = (n_sub - n + 0.5) / n_sub^2
         fast = ssprk3_step!(Lfast, fast, t + (n - 1) * Δtf, Δtf)
         if n < n_sub
-            axpy!(eta_mean, 1.0, fast.h)   # accumulate H0 + η_n
+            axpy!(eta_mean, 1.0, fast.h)   # accumulate H + η_n
             axpy!(ubar_mean, 1.0, fast.u)
         end
     end
     axpy!(eta_mean, 0.5, fast.h)           # + η_end/2 (trapezoid close)
-    scale!(eta_mean, 1.0 / n_sub)          # [m]: time-mean (H0 + η)
+    scale!(eta_mean, 1.0 / n_sub)          # [m]: time-mean (H + η)
     axpy!(ubar_mean, 0.5, fast.u)
     scale!(ubar_mean, 1.0 / n_sub)         # time-mean ū (same weights)
     eta1 = lincomb!(similar_field(eta0), 1.0, eta_mean,
-                    -1.0, fill!(similar_field(eta0), H0))  # η̄ = mean − H0
+                    -1.0, Hcol)                            # η̄ = mean − H
     # time-mean ū with the SAME trapezoid weights as η̄: the fast state
     # is carried as the filtered pair (η̄, ū̄) — MPAS-O split-explicit
     # (Ringler et al. 2013 §3c) restarts the barotropic subcycle from the
@@ -1038,25 +1071,23 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
 
     # re-stretch the column to the coordinate map with the TIME-MEAN
     # fast η (anti-aliasing; see the accumulation above). The column
-    # correction Δcol = (H0 + η̄) − Σh preserves the baroclinic
+    # correction Δcol = (H + η̄) − Σh preserves the baroclinic
     # structure; its distribution is coordinate-dependent:
     colsum = similar_field(work.h[1])
     fill!(colsum, 0.0)
     for k in 1:K
         axpy!(colsum, 1.0, work.h[k])
     end
-    #   :zstar   — proportional stretch h_k ← h_k·(H0+η̄)/Σh (the column
+    #   :zstar   — proportional stretch h_k ← h_k·(H+η̄)/Σh (the column
     #              stretches with the surface; fractions preserved)
     #   :simplez — the whole anomaly goes into the top layer (the
     #              lower levels sit at fixed depths)
-    dcol = lincomb!(similar_field(eta1), 1.0,
-                    fill!(similar_field(eta1), H0), 1.0, eta1)  # H0 + η̄
+    dcol = lincomb!(similar_field(eta1), 1.0, Hcol, 1.0, eta1)  # H + η̄
     axpy!(dcol, -1.0, colsum)                              # Δcol [m]
     if grid.mode === :simplez
         axpy!(work.h[1], 1.0, dcol)
     else
-        ratio = lincomb!(similar_field(eta1), 1.0,
-                         fill!(similar_field(eta1), H0), 1.0, eta1)
+        ratio = lincomb!(similar_field(eta1), 1.0, Hcol, 1.0, eta1)
         for i in eachindex(ratio)
             ratio[i] = ratio[i] / colsum[i]
         end
@@ -1072,11 +1103,11 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     # (volume compatibility; module header "tracers"):
     #   F_k = F_sl,k + (ĥ_k/Σ_j ĥ_j)·(F̄_bt − Σ_j F_sl,j),  ĥ = edge_mean(h_old)
     # Σ_k F_k = F̄_bt, so Σ_k h_horiz,k = Σ_k h_old,k − (Δt/R)∇·F̄_bt
-    # = H0 + η̄ = Σ_k h_new,k: the surface interface velocity diagnosed
+    # = H + η̄ = Σ_k h_new,k: the surface interface velocity diagnosed
     # by the FCT vanishes and no tracer crosses the sea surface. The
     # slow column transport Σ F_sl (nonzero whenever u′ has a column
     # mean) is replaced by F̄_bt exactly as the re-stretch replaces the
-    # slow column volume by H0 + η̄. `fct_advect_tracer!` takes a
+    # slow column volume by H + η̄. `fct_advect_tracer!` takes a
     # VELOCITY and forms F = ĥ_old·u itself, so the flux is passed as
     # u_tr = F/ĥ_old (exact up to one rounding). Edges with ĥ_old,k = 0
     # (layer empty on both flanks at step start) cannot carry flux in
@@ -1100,15 +1131,16 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         if regrid
             # --- z* ALE regrid (issue #62, DESIGN.md D7; module
             # header): restore the layers to the z* target
-            # h_k = Δf_k·(H0 + η̄). Its column total equals the
-            # re-stretched Σ_k h_k (both H0 + η̄), so the regrid is a
+            # h_k = Δf_k·(H + η̄). Its column total equals the
+            # re-stretched Σ_k h_k (both H + η̄), so the regrid is a
             # pure vertical redistribution: u by the conservative
             # limited edge-column remap from the Lagrangian layers to
             # the target; T/S by the same FCT step with h_new = target,
             # whose continuity-residual vertical flux carries the
             # Lagrangian → target transport (limited PLM, one flux per
             # interface: content exact).
-            target = layer_thickness(grid, eta1)
+            target = bathymetry === nothing ? layer_thickness(grid, eta1) :
+                     layer_thickness(grid, eta1, bathymetry)
             _remap_edge_columns!(work.u, work.h, target)
             fct_advect_tracer!(work.T, state.h, target, u_tr, Δt;
                                vertical_order = 2)
@@ -1146,11 +1178,22 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
 
     # --- minimum-thickness floor (opt-in) ---
     if min_h_frac > 0
-        _apply_thickness_floor!(work.h, (work.T, work.S), work.eta,
-                                min_h_frac * H0, H0; stats = floor_stats)
+        if bathymetry === nothing
+            _apply_thickness_floor!(work.h, (work.T, work.S), work.eta,
+                                    min_h_frac * H0, H0; stats = floor_stats)
+        else
+            _apply_thickness_floor!(work.h, (work.T, work.S), work.eta,
+                                    scale!(copyto!(similar_field(bathymetry), bathymetry),
+                                           min_h_frac),
+                                    bathymetry; stats = floor_stats)
+        end
     end
     return work
 end
+
+"Per-column value of a scalar (flat) or `CellField` (per-cell) quantity."
+_column_value(x::Real, i) = x
+_column_value(x::CellField, i) = x[i]
 
 """
     _apply_thickness_floor!(h, tracers, eta, h_min, H0; stats = nothing)
@@ -1176,17 +1219,19 @@ al. 2018 §2.6), per column i:
    exists. Every layer is set to h_min (tracer concentrations kept;
    layers with h ≤ 0 take the column's thickness-positive-weighted mean,
    or keep their own value if none), η is raised accordingly so the
-   column stays consistent (Σ h − H0 = η), and the added volume
+   column stays consistent (Σ h − H = η), and the added volume
    K·h_min − Σ_k h_k [m] is NOT conserved: counted in
    `stats[:added_volume_columns]` and summed (per-column metres, not
    area-weighted) in `stats[:added_volume_m]`.
 
 `h` is a `LayeredCellField`, `tracers` a tuple of `LayeredCellField`s
 remapped with h, `eta` the surface `CellField`; `stats` is `nothing` or
-a `Dict{Symbol, Float64}` that is accumulated into.
+a `Dict{Symbol, Float64}` that is accumulated into. `h_min` and the
+column depth `H0` are numbers (flat bottom) or `CellField`s (per-column
+values under variable bathymetry, issue #65).
 """
 function _apply_thickness_floor!(h::LayeredCellField, tracers, eta::CellField,
-                                 h_min::Real, H0::Real; stats = nothing)
+                                 h_min_col, H_col; stats = nothing)
     K = nlayers(h)
     taken = zeros(Float64, K)
     gained = zeros(Float64, K)
@@ -1195,6 +1240,7 @@ function _apply_thickness_floor!(h::LayeredCellField, tracers, eta::CellField,
     bump!(key, v) = stats === nothing ||
                     (stats[key] = get(stats, key, 0.0) + v; nothing)
     for i in eachindex(h[1])
+        h_min = _column_value(h_min_col, i)
         deficit = 0.0
         headroom = 0.0
         col = 0.0
@@ -1272,7 +1318,7 @@ function _apply_thickness_floor!(h::LayeredCellField, tracers, eta::CellField,
             for k in 1:K
                 h[k][i] = h_min
             end
-            eta[i] = K * h_min - H0
+            eta[i] = K * h_min - _column_value(H_col, i)
             bump!(:added_volume_columns, 1.0)
             bump!(:added_volume_m, added)
         end
@@ -1285,7 +1331,8 @@ end
                      n_sub = nothing, Omega = nothing, nu_h = 0.0,
                      min_h_frac = 0.0, c_drag = 0.0,
                      tracer_advection = :fct, floor_stats = nothing,
-                     regrid = false, closed_edges = nothing)
+                     regrid = false, closed_edges = nothing,
+                     bathymetry = nothing)
         -> OceanState
 
 Integrate `n_steps` equal mode-split steps (see [`ocean_step!`](@ref)
@@ -1297,7 +1344,7 @@ function ocean_integrate!(state::OceanState, grid::VerticalGrid,
                           nu_h::Real = 0.0, min_h_frac::Real = 0.0,
                           c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
                           floor_stats = nothing, regrid::Bool = false,
-                          closed_edges = nothing)
+                          closed_edges = nothing, bathymetry = nothing)
     Δt = (t_final - t0) / n_steps
     for n in 1:n_steps
         state = ocean_step!(state, grid, eos, t0 + (n - 1) * Δt, Δt;
@@ -1305,7 +1352,8 @@ function ocean_integrate!(state::OceanState, grid::VerticalGrid,
                             min_h_frac = min_h_frac, c_drag = c_drag,
                             tracer_advection = tracer_advection,
                             floor_stats = floor_stats, regrid = regrid,
-                            closed_edges = closed_edges)
+                            closed_edges = closed_edges,
+                            bathymetry = bathymetry)
     end
     return state
 end
