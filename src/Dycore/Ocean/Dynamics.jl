@@ -169,8 +169,12 @@
 #     Leer (1977, JCP 23) for the limited remap.
 #
 # This is a Lie splitting: O(Δt_slow) splitting error per step. The
-# depth-mean Coriolis of ū is advanced by the fast solver only (the
-# slow system evolves anomalies), so no double-counting. The barotropic
+# slow momentum terms (PV flux, kinetic energy, drag) are evaluated with
+# the FULL velocity u′ + ū_start (issue #70; MPAS-O split-explicit), so
+# the ū × u′ cross terms are kept; their ū-only part (Coriolis and
+# self-advection of ū, depth-uniform) is removed by the projection and,
+# through the u′ = 0 reference of the barotropic forcing, left to the
+# fast solver — no double-counting. The barotropic
 # transport does not advect layer thicknesses within a slow step (the
 # fast ū appears in the layers only through the re-stretch); this is
 # the standard "anomaly-form" split and is adequate while the barotropic
@@ -409,6 +413,16 @@ Projection (`projection`):
   written into `depth_mean_out` (an `EdgeField`, if given), from which
   the driver forms the barotropic forcing (module header).
 
+Barotropic velocity (`ubar_adv`, issue #70): `nothing` (default) — the
+momentum terms act on `state.u` alone; an `EdgeField` ū — `state.u`
+holds the anomaly u′ and the PV flux −q̂F⊥, the kinetic-energy gradient
+and the collapsed-layer drag are evaluated with the FULL velocity
+u′ + ū (keeping the ū × u′ cross terms −ζ̄u′⊥ − ζ′ū⊥ − ∇(ū·u′)), while
+the continuity flux stays the anomaly flux ĥu′ and the viscosity acts
+on u′. [`ocean_step!`](@ref) passes the start-of-step ū; the
+depth-mean of the ū-only part is removed again through the barotropic
+forcing reference (see `ocean_step!`).
+
 Walls: `free_slip_vertices` (vertex indices; ζ = 0 there in the PV and
 the viscous Laplacian) and `ke_closed_edges` (edge indices; wall cells
 average the kinetic energy over open edges) — see
@@ -423,7 +437,8 @@ function ocean_tendency!(out::OceanState, state::OceanState;
                          Omega = nothing, f0 = nothing, nu_h::Real = 0.0,
                          c_drag::Real = 0.0, advect_tracers::Bool = true,
                          free_slip_vertices = nothing, ke_closed_edges = nothing,
-                         depth_mean_out = nothing, projection::Symbol = :pressure)
+                         depth_mean_out = nothing, projection::Symbol = :pressure,
+                         ubar_adv = nothing)
     mesh = mesh_of(state.h)
     projection in (:pressure, :full) ||
         throw(ArgumentError("ocean_tendency!: projection must be :pressure or :full"))
@@ -446,6 +461,19 @@ function ocean_tendency!(out::OceanState, state::OceanState;
     us = similar(state.u)
     for k in 1:K
         scale!(copyto!(us[k], state.u[k]), 1 / R)
+    end
+    # full layer velocities u* = (u′ + ū)/R for the momentum terms
+    # (issue #70; `ubar_adv` = the barotropic ū during a split step):
+    # the PV flux, kinetic energy and drag act on the FULL velocity, so
+    # the ū × u′ cross terms (−ζ̄u′⊥ − ζ′ū⊥ − ∇(ū·u′)) are kept; the
+    # continuity flux stays the pure anomaly flux ĥu′ (the barotropic
+    # transport belongs to the fast mode)
+    uf = us
+    if ubar_adv !== nothing
+        uf = similar(state.u)
+        for k in 1:K
+            lincomb!(uf[k], 1 / R, state.u[k], 1 / R, ubar_adv)
+        end
     end
 
     # scaled thicknesses h* = h/R
@@ -490,16 +518,17 @@ function ocean_tendency!(out::OceanState, state::OceanState;
         # see module header)
         Fk = edge_mean(hs[k]) * us[k]
         divergence!(out.h[k], Fk)
+        Ff = ubar_adv === nothing ? Fk : edge_mean(hs[k]) * uf[k]
         scale!(out.h[k], -R)
 
         # --- momentum bracket [m/s²], pressure part only:
         #   −∇(p̄_k/ρ0)/R² − (g ρ_k/ρ0)·∇z̄_k/R²  (NO Cor/KE yet)
-        q = potential_vorticity(us[k], hs[k], fvert;
+        q = potential_vorticity(uf[k], hs[k], fvert;
                                 free_slip_vertices = free_slip_vertices)
-        Cor = pv_flux(q, Fk)
+        Cor = pv_flux(q, Ff)
         du = gradient(pbar)                # [m²/s²/rad]
         bz = edge_mean(rho_frac) * gradient(zbar[k])   # (ρ_k/ρ0)∇z̄ [m/rad]
-        Kk = kinetic_energy(us[k]; closed_edges = ke_closed_edges)
+        Kk = kinetic_energy(uf[k]; closed_edges = ke_closed_edges)
         lincomb!(out.u[k], -1.0 / R^2, du, 0.0, du)  # −∇(p̄/ρ0)/R²
         axpy!(out.u[k], -g / R^2, bz)      # − b ∇z̄_k
         scale!(out.u[k], R)                # → [m/s²]
@@ -596,7 +625,7 @@ function ocean_tendency!(out::OceanState, state::OceanState;
         h_drag_on = 0.05 * grid.H0 / R
         for k in 1:K
             hK = hs[k]                     # scaled thickness [rad]
-            ue = us[k]                     # scaled velocity [rad/s]
+            ue = uf[k]                     # FULL scaled velocity [rad/s] (#70)
             for e in 1:mesh.n_edges
                 i, j = mesh.edge_cells[1, e], mesh.edge_cells[2, e]
                 # MIN of the flanking thicknesses, not the mean: at a
@@ -1001,9 +1030,11 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     # mean of the slow momentum tendency at the step start that is NOT
     # the surface-pressure force −g∇η (the fast solver's own term):
     #   G = ⟨∂u/∂t⟩(state) − ⟨∂u/∂t⟩(state with ρ ≡ ρ0, u′ = 0),
-    # held fixed over the substeps. The reference evaluation has uniform
-    # density and no anomaly flow, so its depth-mean is exactly the
-    # slow operator's discrete response to η alone; subtracting it
+    # held fixed over the substeps (both evaluations with the momentum
+    # terms on u′ + ū_start, issue #70). The reference evaluation has
+    # uniform density and no anomaly flow, so its depth-mean is exactly
+    # the slow operator's discrete response to η and ū alone (the fast
+    # solver's own terms); subtracting it
     # removes the η-dependence with the SAME discretization. (Subtracting
     # the fast solver's −g∇η instead leaves the slow/fast discretization
     # mismatch — the layer-weighted depth-mean PGF is only approximately
@@ -1021,6 +1052,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         end
         tend0 = copy(start)
         ocean_tendency!(tend0, start; grid = grid, eos = eos, eta = eta0,
+                        ubar_adv = ubar0,
                         Omega = Omega, f0 = f0, nu_h = nu_h,
                         c_drag = c_drag,
                         advect_tracers = false, free_slip_vertices = wallv,
@@ -1038,6 +1070,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         end
         Gref = similar_field(ubar0)
         ocean_tendency!(copy(ref), ref; grid = grid, eos = eos, eta = eta0,
+                        ubar_adv = ubar0,
                         Omega = Omega, f0 = f0, nu_h = nu_h,
                         c_drag = c_drag,
                         advect_tracers = false, free_slip_vertices = wallv,
@@ -1095,6 +1128,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     sstage = Ref(0)
     function L(out, s, τ)
         ocean_tendency!(out, s; grid = grid, eos = eos, eta = eta0,
+                        ubar_adv = ubar0,
                         Omega = Omega, f0 = f0, nu_h = nu_h,
                         c_drag = c_drag,
                         advect_tracers = !use_fct,
