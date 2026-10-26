@@ -212,6 +212,7 @@ using ..OceanVertical: ssh_from_thickness, layer_center_z, layer_thickness
 using ..OceanEOS: AbstractOceanEOS, ocean_density, ocean_density!
 using ..OceanTracers: tracer_tendency!
 using ..TracerFCT: fct_advect_tracer!, _mc
+using ..OceanPGF: PGF_SCHEMES, pressure_gradient
 using ..ShallowWater: williamson_constants
 using ..Atmos: SWState, sw_step!, sw_tendency!
 using ..TimeStepping: ssprk3_step!, ssprk3_integrate!
@@ -357,7 +358,8 @@ end
                     f0 = nothing, nu_h = 0.0, c_drag = 0.0,
                     advect_tracers = true,
                     free_slip_vertices = nothing, ke_closed_edges = nothing,
-                    depth_mean_out = nothing, projection = :pressure)
+                    depth_mean_out = nothing, projection = :pressure,
+                    ubar_adv = nothing, pgf = :twoterm)
         -> OceanState
 
 Baroclinic (slow) tendency of the layered system — see the module
@@ -423,6 +425,11 @@ on u′. [`ocean_step!`](@ref) passes the start-of-step ū; the
 depth-mean of the ū-only part is removed again through the barotropic
 forcing reference (see `ocean_step!`).
 
+Pressure gradient (`pgf`, issue #73): `:twoterm` (default) assembles
+−∇(p̄_k/ρ0) − b_k∇z̄_k here; `:adcroft2008`, `:mom6` and `:roms` take
+the acceleration from [`pressure_gradient`](@ref) (module `OceanPGF`,
+which documents each scheme and its source).
+
 Walls: `free_slip_vertices` (vertex indices; ζ = 0 there in the PV and
 the viscous Laplacian) and `ke_closed_edges` (edge indices; wall cells
 average the kinetic energy over open edges) — see
@@ -438,10 +445,12 @@ function ocean_tendency!(out::OceanState, state::OceanState;
                          c_drag::Real = 0.0, advect_tracers::Bool = true,
                          free_slip_vertices = nothing, ke_closed_edges = nothing,
                          depth_mean_out = nothing, projection::Symbol = :pressure,
-                         ubar_adv = nothing)
+                         ubar_adv = nothing, pgf::Symbol = :twoterm)
     mesh = mesh_of(state.h)
     projection in (:pressure, :full) ||
         throw(ArgumentError("ocean_tendency!: projection must be :pressure or :full"))
+    pgf in PGF_SCHEMES ||
+        throw(ArgumentError("ocean_tendency!: pgf must be one of $PGF_SCHEMES, got $pgf"))
     (; R, g) = williamson_constants()
     fvert = coriolis_parameter(mesh; Omega = Omega, f0 = f0)
     K = nlayers(state.h)
@@ -493,6 +502,12 @@ function ocean_tendency!(out::OceanState, state::OceanState;
     zbar = [lincomb!(similar_field(state.h[k]), 0.5, z[k], 0.5, z[k + 1])
             for k in 1:K]
 
+    # pressure-gradient acceleration of the selected scheme [m/s²]
+    # (issue #73; :twoterm is assembled in the layer loop below)
+    pg = pgf === :twoterm ? nothing :
+         pressure_gradient(pgf, state.h, z, ρ, eos.ρ0;
+                           closed_edges = ke_closed_edges)
+
     # per-layer Coriolis/Bernoulli scratch (edge fields, one per layer) —
     # assembled in the layer loop, re-attached after the depth-mean
     # projection (they are baroclinic dynamics, not pressure force)
@@ -529,9 +544,13 @@ function ocean_tendency!(out::OceanState, state::OceanState;
         du = gradient(pbar)                # [m²/s²/rad]
         bz = edge_mean(rho_frac) * gradient(zbar[k])   # (ρ_k/ρ0)∇z̄ [m/rad]
         Kk = kinetic_energy(uf[k]; closed_edges = ke_closed_edges)
-        lincomb!(out.u[k], -1.0 / R^2, du, 0.0, du)  # −∇(p̄/ρ0)/R²
-        axpy!(out.u[k], -g / R^2, bz)      # − b ∇z̄_k
-        scale!(out.u[k], R)                # → [m/s²]
+        if pg === nothing
+            lincomb!(out.u[k], -1.0 / R^2, du, 0.0, du)  # −∇(p̄/ρ0)/R²
+            axpy!(out.u[k], -g / R^2, bz)      # − b ∇z̄_k
+            scale!(out.u[k], R)                # → [m/s²]
+        else
+            copyto!(out.u[k], pg[k])           # [m/s²] (OceanPGF)
+        end
         # Coriolis/Bernoulli bracket [m/s²]: −Q̂⊥_k − ∇K*_k·R
         # both terms are scaled-variable brackets [rad/s²] → ·R [m/s²]
         # (as in sw_tendency!; issue #66: the PV flux was once left
@@ -842,7 +861,7 @@ end
                 nu_h = 0.0, c_drag = 0.0, min_h_frac = 0.0,
                 tracer_advection = :fct, floor_stats = nothing,
                 regrid = false, closed_edges = nothing,
-                bathymetry = nothing, f0 = nothing)
+                bathymetry = nothing, f0 = nothing, pgf = :twoterm)
         -> OceanState
 
 Advance one mode-split step of Δt [s] (single-region state):
@@ -918,6 +937,13 @@ Keywords:
   issue #45; overrides `Omega`). The fast barotropic mode uses the
   SAME f as the slow layers (before #45 it always rotated with Earth's
   Ω, whatever `Omega` was).
+- `pgf` — the horizontal pressure-gradient scheme (issue #73), one of
+  `PGF_SCHEMES`: `:twoterm` (default; the #30 −∇p̄ − b∇z̄ form),
+  `:adcroft2008` (finite-volume, analytic integration; Adcroft et al.
+  2008), `:mom6` (the same with PLM density reconstruction within layers,
+  MOM6's production form) or `:roms` (Shchepetkin & McWilliams 2003
+  density Jacobian, ROMS prsgrd32). Used by the slow stages and both
+  barotropic-forcing evaluations. See `OceanPGF`.
 - `bathymetry` — `nothing` (default: flat bottom at `grid.H0`) or a
   `CellField` of positive depths H [m] (issue #65, DESIGN.md D7; e.g.
   the #49 `bathymetry_*` profiles). The bottom sits at z = −H(x, y):
@@ -944,7 +970,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
                      c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
                      floor_stats = nothing, regrid::Bool = false,
                      closed_edges = nothing, bathymetry = nothing,
-                     f0 = nothing)
+                     f0 = nothing, pgf::Symbol = :twoterm)
     mesh = mesh_of(state.h)
     (; R, g) = williamson_constants()
     fvert = coriolis_parameter(mesh; Omega = Omega, f0 = f0)
@@ -1052,7 +1078,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         end
         tend0 = copy(start)
         ocean_tendency!(tend0, start; grid = grid, eos = eos, eta = eta0,
-                        ubar_adv = ubar0,
+                        ubar_adv = ubar0, pgf = pgf,
                         Omega = Omega, f0 = f0, nu_h = nu_h,
                         c_drag = c_drag,
                         advect_tracers = false, free_slip_vertices = wallv,
@@ -1070,7 +1096,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
         end
         Gref = similar_field(ubar0)
         ocean_tendency!(copy(ref), ref; grid = grid, eos = eos, eta = eta0,
-                        ubar_adv = ubar0,
+                        ubar_adv = ubar0, pgf = pgf,
                         Omega = Omega, f0 = f0, nu_h = nu_h,
                         c_drag = c_drag,
                         advect_tracers = false, free_slip_vertices = wallv,
@@ -1128,7 +1154,7 @@ function ocean_step!(state::OceanState, grid::VerticalGrid,
     sstage = Ref(0)
     function L(out, s, τ)
         ocean_tendency!(out, s; grid = grid, eos = eos, eta = eta0,
-                        ubar_adv = ubar0,
+                        ubar_adv = ubar0, pgf = pgf,
                         Omega = Omega, f0 = f0, nu_h = nu_h,
                         c_drag = c_drag,
                         advect_tracers = !use_fct,
@@ -1418,7 +1444,7 @@ end
                      min_h_frac = 0.0, c_drag = 0.0,
                      tracer_advection = :fct, floor_stats = nothing,
                      regrid = false, closed_edges = nothing,
-                     bathymetry = nothing, f0 = nothing)
+                     bathymetry = nothing, f0 = nothing, pgf = :twoterm)
         -> OceanState
 
 Integrate `n_steps` equal mode-split steps (see [`ocean_step!`](@ref)
@@ -1431,7 +1457,7 @@ function ocean_integrate!(state::OceanState, grid::VerticalGrid,
                           c_drag::Real = 0.0, tracer_advection::Symbol = :fct,
                           floor_stats = nothing, regrid::Bool = false,
                           closed_edges = nothing, bathymetry = nothing,
-                          f0 = nothing)
+                          f0 = nothing, pgf::Symbol = :twoterm)
     Δt = (t_final - t0) / n_steps
     for n in 1:n_steps
         state = ocean_step!(state, grid, eos, t0 + (n - 1) * Δt, Δt;
@@ -1440,7 +1466,7 @@ function ocean_integrate!(state::OceanState, grid::VerticalGrid,
                             tracer_advection = tracer_advection,
                             floor_stats = floor_stats, regrid = regrid,
                             closed_edges = closed_edges,
-                            bathymetry = bathymetry, f0 = f0)
+                            bathymetry = bathymetry, f0 = f0, pgf = pgf)
     end
     return state
 end
