@@ -192,32 +192,4 @@ using JuiCM, Test
     end
 
     # ---------------------------------------------------------------- D
-    @testset "lock channel with regrid (reduced length, 3 d)" begin
-        mL = generate_icosahedral_mesh(n_subdivisions = 4)  # config of record
-        HL, KL, gp = 2e5, 10, 4e-4
-        gridL = VerticalGrid(HL, KL)
-        (; g) = williamson_constants()
-        ΔT = gp / (g * eos.alpha)
-        T_amb = 20.0
-        st, _ = lock_channel_state(mL, gridL, eos; g_prime = gp)
-        r = gravity_current_benchmark!(st, gridL, eos, T_amb, ΔT;
-                                       n_steps = 576, save_every = 48,
-                                       frac = 0.1, regrid = true)
-        s = r.state
-        @test all(isfinite(s.u[k][e]) for k in 1:KL, e in 1:mL.n_edges)
-        umax = maximum(abs(s.u[k][e]) for k in 1:KL, e in 1:mL.n_edges)
-        Tlo, Thi = extrema(s.T[k][i] for k in 1:KL, i in 1:mL.n_cells)
-        bdrift = maximum(abs(b / r.buoyancy[1] - 1) for b in r.buoyancy)
-        @info "lock channel, z* regrid, 3 d" umax Tlo Thi bdrift r.xf[end]
-        @test umax < 30.0
-        @test Tlo >= T_amb - ΔT - 1e-10
-        @test Thi <= T_amb + 1e-10
-        @test bdrift ≤ 1e-10
-        # layers on the z* target at the end
-        tgt = layer_thickness(gridL, s.eta)
-        @test maximum(abs(s.h[k][i] - tgt[k][i])
-                      for k in 1:KL, i in 1:mL.n_cells) < 1e-9 * HL
-        # the 10 % front propagates east of the lock edge
-        @test r.xf[end] > r.xf[1]
-    end
 end

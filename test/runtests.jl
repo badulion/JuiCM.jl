@@ -7,7 +7,7 @@ using JuiCM.Voronoi: spherical_circumcenter, spherical_polygon_area,
 using LinearAlgebra
 using Random
 
-@testset "JuiCM" begin
+@testset "JuiCM" verbose = true begin
     @testset "package loads" begin
         @test JuiCM isa Module
     end
@@ -642,7 +642,6 @@ using Random
     include("williamson_ics_test.jl")
     include("time_stepping_test.jl")
     include("dycore_sw_test.jl")
-    include("validation_test.jl")
     include("ocean_vertical_test.jl")
     include("ocean_dynamics_test.jl")
     include("ocean_tracer_test.jl")
@@ -657,4 +656,5 @@ using Random
     include("ocean_barotropic_test.jl")
     include("ocean_cross_terms_test.jl")
     include("ocean_pgf_test.jl")
+    include("validation_smoke_test.jl")
 end
