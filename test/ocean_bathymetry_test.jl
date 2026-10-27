@@ -87,33 +87,20 @@ using Test
                       for i in 1:m.n_cells) < 1e-9
     end
 
-    @testset "z* PGF over a slope: stratified rest (DESIGN.md §7)" begin
-        # linear stratification T = 20 + 5 K · z/1000 m (N ≈ 0.01 1/s,
-        # internal speed √(g′H) ≈ 10 m/s): terrain-following z* layers
-        # cross the isotherms on the slope, and the two-term PGF
-        # (−∇p̄ − b∇z̄) does not cancel exactly there — the classic
-        # σ-coordinate error. Measured (5-day run): max |u| 2–3 mm/s,
-        # bounded (no growth). The bound below is 1 cm/s, 1e-3 of the
-        # internal wave speed.
+
+    @testset "z* PGF over a slope: stratified rest, 1 day (smoke)" begin
+        # the 5-day bound (DESIGN.md §7, measured 2–3 mm/s) runs in
+        # validation/x65_zstar_pgf_stratified.jl (issue #75)
         s = resting_state(m, grid, H, (m, i, z) -> 20.0 + 5.0 * z / 1000)
         v0 = volume(m, s)
         c0 = content(m, s, s.T)
-        Tlo0, Thi0 = extrema(s.T[k][i] for k in 1:K, i in 1:m.n_cells)
-        u_t = Float64[]
-        for n in 1:120
+        for n in 1:24
             s = ocean_step!(s, grid, eos, (n - 1) * 3600.0, 3600.0;
                             regrid = true, bathymetry = H)
-            n % 24 == 0 && push!(u_t, umax(m, s))
         end
-        @info "z* PGF error over the slope (max |u| per day)" u_t
-        @test maximum(u_t) < 1e-2
-        @test u_t[end] < 2 * u_t[1]                 # bounded, not growing
-        # volume and heat content conserved to round-off, T bounded
+        @test umax(m, s) < 1e-2
         @test abs(volume(m, s) / v0 - 1) < 1e-12
         @test abs(content(m, s, s.T) / c0 - 1) < 1e-12
-        Tlo, Thi = extrema(s.T[k][i] for k in 1:K, i in 1:m.n_cells)
-        @test Tlo >= Tlo0 - 1e-10
-        @test Thi <= Thi0 + 1e-10
     end
 
     @testset "dense release on the shelf: conservation over a slope" begin

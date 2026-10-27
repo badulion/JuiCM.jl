@@ -1,3 +1,5 @@
+# Moved unchanged from test/validation_test.jl (issue #75).
+
 # Williamson validation suite (#12, DESIGN.md §4 rungs V0/V1, §5 Phase 1
 # exit criterion).
 #

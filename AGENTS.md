@@ -51,24 +51,37 @@ code:
   (docstrings for public API; `docs/` updates when user-facing behavior
   changes). A physics module PR documents its equations and their source.
 - **Tests:** every new behavior is covered by tests in `test/`. Numerical
-  code gets quantitative tests, not just "runs without error" — conservation
-  checks, convergence order, or comparison against reference values
-  (validation-ladder rungs live in `test/` and are part of the suite).
+  code gets quantitative tests, not just "runs without error": conservation
+  checks, convergence order, or comparison against reference values.
   Bug-fix PRs add a regression test that fails before the fix.
+- **Two suites (owner decision, #75):**
+  - `test/` (`Pkg.test()`) is the **fast suite**: no testset may take
+    longer than **30 s**. Fast tests check that the code works (exact
+    identities, conservation, short runs); they need not confirm physical
+    accuracy or long-term stability.
+  - `validation/` is the **validation suite**: the DESIGN.md §4
+    validation-ladder rungs and other long, full-accuracy runs against
+    published values. Every validation rung keeps a ≤ 30 s smoke test of
+    the same code path in `test/`.
 
 Write docs and tests **before** opening the PR, not as a follow-up. A PR
 without docs and tests is incomplete — do not submit it.
 
 ### 3. Merge gate: all tests pass locally
 
-1. Run the full test suite locally:
+1. Run the fast suite locally:
    ```bash
    julia --project=. -e 'using Pkg; Pkg.test()'
    ```
-2. The **entire** suite must pass. Never skip, `@test_skip`, or weaken a test
-   to make it green. If a validation test fails, that is the finding — report
-   it in the issue, don't merge around it.
-3. If and only if the full suite passes locally, the PR may be merged
+   If the PR changes numerics or physics (dycore, operators, mesh, time
+   stepping, physics modules, benchmarks), also run the validation suite:
+   ```bash
+   julia --project=test validation/runtests.jl
+   ```
+2. Every suite you are required to run must pass **in full**. Never skip,
+   `@test_skip`, or weaken a test to make it green. If a validation test
+   fails, that is the finding: report it in the issue, don't merge around it.
+3. Only if every required suite passes locally may the PR be merged
    (auto-merge is authorized for this repo).
 4. After merge: close the issue (the `Closes #N` reference does this), delete
    the branch, and post a one-paragraph summary of what landed in the issue
@@ -85,8 +98,9 @@ permitting CI-free merges after that change exists.
 1. **No new GCM dependencies.** `DESIGN.md` §6 has the allowlist. Anything that
    is itself a dynamical core, coupler, or physics package is forbidden.
 2. **Never weaken or delete a passing validation test.** Validation-ladder
-   tests (Williamson, Held-Suarez, gravity current, overflow, spin-up budgets)
-   are the project's immune system. Changing tolerances requires a dedicated
+   tests (Williamson, Held-Suarez, gravity current, overflow, spin-up budgets;
+   they live in `validation/`) are the project's immune system. Moving a test
+   between `test/` and `validation/` unchanged is not weakening it. Changing tolerances requires a dedicated
    issue with justification, and a human decision.
 3. **No direct indexing into `Field.data`** outside `src/Fields/`. Physics code
    goes through operators — this is what keeps the MPI escape hatch
